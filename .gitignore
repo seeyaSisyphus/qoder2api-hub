@@ -12,6 +12,8 @@ __pycache__/
 *.pyo
 
 # ---- 本地工具 / 临时文件 ----
+*.bak
+*.bak-*
 .mimosa/
 _shots/
 *.log
