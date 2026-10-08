@@ -19,7 +19,7 @@
 - **稳定物理设备指纹隔离 (`derive_id`)**：以账号自身 UID 稳定哈希派生专属 `cosy-machineid` / `cosy-machinetoken` / 会话标识，同一账号长期固定在同一台虚拟物理设备，天然防多号关联风控。
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（官方能力门控）**：签到/Pro 福利活动**仅国内版提供**（国际版官方无签到接口）；国内版每日签到（活动 `DISABLED` 时诚实跳过不硬领）、连续签到统计、Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
-- **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
+- **后台常驻定时调度器**：每日 22:00 Token 集中保活（签到已移交 `qoder2api` 计划任务，见 §4），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
 - **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译与 DSML 工具调用回退解析。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
@@ -89,7 +89,107 @@
 - **安全防冲突**：面板配置过 Key 后，启动脚本里的旧 `--api-key` 自动失效；
 - **模型区域自检**：Key 出口与模型区域不匹配时返回通俗 400，杜绝上游晦涩拒流报错。
 
-### 5. Docker 容器化部署
+### 5. 网络出口与 TLS 指纹（风控特征收敛）
+
+本网关对**出站网络特征**做了显式收敛，避免多账号反代中最容易被关联的两类信号：
+
+#### 出口（egress）：默认直连，忽略进程级代理变量
+
+Python 的 `urllib` 默认 opener 会隐式读取进程级 `HTTP_PROXY` / `HTTPS_PROXY` /
+`ALL_PROXY`。网关进程一旦继承用户级代理变量，**连国内版（qoder.com.cn）也会被迫走代理**，
+把两个本来独立的故障域耦合在一起（代理一抖，全线瘫痪）。因此：
+
+- **默认直连**，不读上述环境变量；
+- 需要代理时显式配置：全局用 `QD_HTTP_PROXY` / `QD_HTTPS_PROXY`；
+- **账号级出口**：账号 JSON 加 `"egress": {"https_proxy": "http://127.0.0.1:7890"}`，
+  实现「一账号一出口」（原则：一个账号长期一个出口，不随请求轮换 IP）；
+- **国内版（`*.qoder.com.cn`）与 localhost 始终直连**——这是来自真实事故的结论：
+  多账号共用境外机房 IP 时 WAF 高频拦截，切回大陆家宽直连后 WAF 归零且快 4.6 倍；
+  强制直连也避免代理抖动把两个独立故障域耦合起来；
+- **国际版（`*.qoder.sh`）可走显式配置的代理**（未配置时同样直连），
+  便于按区分离出口；
+- `GET /health` 的 `egress` 字段显示当前模式（`direct` / `proxy(configured)`）。
+
+> ⚠️ 升级注意：若你原先依赖 `HTTP_PROXY` 访问国际版，需改用 `QD_HTTPS_PROXY`，
+> 否则会静默变直连。升级后先看 `/health` 的 `egress` 字段确认。
+
+#### TLS 指纹（可选，默认关闭）
+
+**这是 HTTP 头无法掩盖的一层。** Python 标准库的 TLS `ClientHello` 是 OpenSSL 出厂形态
+（无 GREASE、无 ALPN、11 个扩展），JA3 恒为 `93c7d42c0df602fb91589311534831f5` ——
+全世界所有 Python 脚本共用同一指纹。由于它在 TLS 握手层、位于 HTTP 之下，
+无论 `User-Agent` 声称什么，都无法改变它。
+
+如需收敛这一层，可**可选**启用 curl_cffi 模仿真实客户端握手：
+
+```bash
+pip install curl_cffi
+export QD_TLS_IMPERSONATE=chrome    # 或 chrome131 / edge101 / safari17_0 等
+python qoder_proxy.py --port 8790
+```
+
+- 启用后一次性解决 **JA3 + ALPN + HTTP/2 + 头顺序**；
+- 自定义头（`User-Agent`、`cosy-*` 等）**不受影响**，仍按账号/区域正常发送；
+- **未安装 curl_cffi 时自动回落标准库**并打印一次告警，不影响可用性；
+- `GET /health` 的 `tls` 字段显示当前模式（`stdlib-openssl` / `impersonate(chrome)`）。
+
+> 保持**默认关闭**是为了守住「纯标准库、零依赖」这条约束（见 Docker alpine 构建）。
+> 自用低频网关通常不必开启；若上游做 TLS 指纹评分，这是唯一有效的应对手段。
+
+### 6. 可观测性与日志（溯源排查）
+
+一次请求的**全链路**可在事后重建，无需复现：
+
+- **`req_id`**：每个推理请求一个 12 位 ID，贯穿该请求的**所有**日志行与落盘记录。
+  并发时能把散落的日志按 ID 串成一条链（`log()` 自动加 `[req_id]` 前缀）。
+- **`usage/events.jsonl`**：机器可读的结构化事件流 —— `request.start` /
+  `queue.wait`（排队每轮一条）/ `retry`（含原因与退避）/ `client.gone` /
+  `request.end`（含全部遥测）。
+- **`usage/usage.jsonl`**：每请求一行，含 `req_id`、`queue_waits`、`queue_ms`、
+  `queue_max_hint_s`、`attempts`、`account_switches`、`retry_reasons`。
+- **`usage/server.log`**：文本日志（stderr 的落盘副本，VBS/服务方式启动时也能查）。
+
+**排查示例**（排队多久、能不能等到）：
+
+```bash
+# 排队统计：排过队的请求有多少、等多久、成功率
+curl -s localhost:8790/usage | python -c "import sys,json;print(json.load(sys.stdin)['queue'])"
+
+# 某次请求的完整链路（先用 req_id 从 usage.jsonl 找到它）
+curl -s 'localhost:8790/logs?req=<req_id>'
+```
+
+**轮转**：`usage.jsonl` / `events.jsonl` / `credits.jsonl` / `server.log` 均按大小
+轮转（默认 8MB × 5 份，`QD_LOG_ROTATE_MB` / `QD_LOG_ROTATE_KEEP` 可调）—— 排队预算
+是 15 分钟量级，无轮转会无界增长。
+
+#### 积分消耗统计（`usage/credits.jsonl`）
+
+**上游不逐请求报积分**：每个响应的 `usage.credit` 字段恒为 0，也没有按天用量接口
+（`/quota/usage/daily` 等候选端点全部 404）。账号额度接口只给**累计值**
+（`userQuota`/`addOnQuota` 的 `used`/`remaining`/`total`）。
+
+因此「某时段消耗了多少积分」无法从任何单一来源算出，只能靠**快照差值**还原：
+
+- 把每个账号的额度快照追加进 `usage/credits.jsonl`（一行一个时间点，含
+  `totals` 汇总与 `accounts` 逐账号明细）。
+- **采样时机：每天定点一次**（默认 **08:00**，`QD_CREDITS_SNAPSHOT_AT` 改，
+  设空串关闭），外加**启动补采**（当日尚无快照时）与**面板「刷新积分」**。
+- **当日消耗 = 相邻采样点的 `used` 差值**，即「昨日 08:00 → 今日 08:00」这一
+  天的用量。同时给出 `remain` 减量作互证 —— 两者不等说明期间有签到/福利补额。
+
+```bash
+# 最近 14 天的每日积分消耗（合计 + 逐账号）
+curl -s -H "Authorization: Bearer <key>"   'localhost:8790/usage/credits?days=14' | python -m json.tool
+
+# 直接看原始快照（每行一个时间点）
+tail -3 usage/credits.jsonl
+```
+
+> 每天 08:00 采一条：**当天 08:00 之后**的用量会算进**次日**那一行（因为要用
+> 次日 08:00 的快照减今天 08:00 的）。首个采样点没有前驱，标 `pending`。
+
+### 7. Docker 容器化部署
 
 ```bash
 # 1. 后台启动容器 (自动构建并运行)
@@ -121,6 +221,56 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - **流内信封层**（关键形态：上游先 HTTP200 建流、再在 SSE 信封里投 `statusCodeValue=418`——表现为 access log 记 200 而业务错 418）：在**尚未向客户端写出任何上游字节**前重开上游重试 2 次（chat 流式/非流式 + Responses 全覆盖），流式客户端全程无感。
 
 重试仍失败才**短冷却（15s，单账号池实际 3s）换号**——不因上游的锅罚账号 60 秒；**短错误冷却期间（≤10s）后续请求改为「等待续上」而非报错**，且 `429 usage exceeds frequency limit` **只在上游真频控时出现**（账号错误冷却不再被误标为频控）。客户端参数错误（`invalid_parameter_error` 等）与**上游内容安全审核拒绝**（`InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content`）**绝不重试**、快速失败——后者返回中文解释（`content_policy_rejected`：确定性拒绝、重试无效，请检查/缩短输入），由调用方修改输入而非等待。耗尽后其余瞬时错误客户端收到中文友好提示（`upstream_transient_error`）；错误详情经 `qoder_detail` 挂载保留 400 字节完整送达日志（含内层 `details`）。
+
+**账号额度耗尽（110/112）与排队是两件相反的事：排队要等，额度耗尽要换号**
+
+| 上游码 | 含义 | 处置 |
+|---|---|---|
+| `10605` | 模型级容量门控（排队） | **等**上游放行（预算 15 分钟） |
+| `110` | `Billing daily count exceeded`（账号当日额度用尽） | **换号** + 该号跨日排除 |
+| `112` | 需订阅 / 额度不足（附 `pricingUrl`） | **换号** + 该号跨日排除 |
+
+曾把 110/112 当普通 403 早退，**不换号、直接失败** —— 实测池中 7 个额度充足的
+账号被闲置，整个请求报废（2026-10-02 15:54，客户端表现为反复 `Reconnecting`）。
+现在：
+
+- 三条链路（非流式 / chat 流式 / responses 流式）**都先判额度、再判瞬时性**；
+- 撞上 110/112 的账号打 **`quotaUntil` 跨日排除**（取「下一个本地 00:00」与固定兜底
+  的较晚者，`QD_QUOTA_COOLDOWN_S` 可调，默认 6h），下次选号自然跳过；
+- 换号重开（额度是账号级状态，换号立刻有效；代价仅一次 prompt 缓存损失）；
+- **全池额度耗尽**时返回 **429 + `Retry-After`**（而非无退避提示的 403，或会被误读成
+  「池子坏了」的 503），文案为 `account_quota_exhausted` 并说明「等待次日重置或补充账号」。
+- 看板可区分「被限流」（`inCooldown`）与「没额度」（`quotaExhausted`/`quotaFor`）——
+  两者运维处置完全不同。
+**上游排队（10605）不是凭证拒绝，也不是频控**：低优先级（p3）模型被容量门控时，
+上游以 **HTTP200 建流 + SSE 信封 statusCodeValue=403（内嵌 10605 排队体）** 投递。
+处理原则（每条都对应一次实测事故）：
+
+1. **不冷却账号、不写 `model_cooldowns`**。排队曾被写进频控冷却，使
+   `realm_model_throttled()` 判定「整池被上游频控」，之后**所有**请求（含其它模型）
+   秒回 429 —— 一个瞬时排队信号打瘫整个池。现在排队与频控严格分开存储。
+2. **不换号**。实测同池账号会**一起**排队（`queueCount` 常为 0 而
+   `serviceAvailable=false`），换号拿不到服务；而在一个请求内轮换会把整池账号
+   全标记成不可用，后续请求随即全部 429。故改为**等上游放行后原样重开**。
+3. **等待期间放掉在途名额**。抱着并发额度睡 30s，会让本号在别的请求眼里变成
+   `at capacity` 而被换号 —— 一个排队请求就能占满整号的并发额度。
+4. **等待预算默认 900s（15 分钟）**，`QD_QUEUE_WAIT_BUDGET` 可调。一次请求的初开与
+   所有重开**共用同一个截止时间**（否则每层各开一轮预算，总等待会叠加 —— 实测过
+   80s+ 超过客户端超时）；单次等待夹到剩余预算内；轮数上限由预算推导（不写死，
+   它同时是防止小 hint 下高频重试的限速阀）。
+5. **等待期间探测客户端是否断开**（`MSG_PEEK` 非破坏性探测）：用户在客户端点「停止」
+   或客户端自身超时后，网关**立刻放弃等待**、不再向上游重试。没有这道保险，大预算会
+   留下长时间空转的请求，每 30s 打一次上游却没人接收 —— 正是要避免的流量特征。
+   （实测：客户端 t=3s 断开后，12s 内只多打 1 次上游；无探测时同期会打满十余次。）
+   
+   > ⚠️ **预算仍应小于你客户端的超时**：否则客户端会在网关还在等的时候先断开，用户
+   > 看到的是**超时**而不是结果（断开探测能止损，但那次等待本身白费了）。默认 900s
+   > 适合超时宽松、且自带「排队中」提示的客户端；客户端超时较短的部署请调小，例如
+   > `QD_QUEUE_WAIT_BUDGET=40`。
+5. 预算耗尽才以 **429 + Retry-After**（取上游 retryAfterSeconds）交还客户端重试，
+   且**不惩罚账号**——排队期间账号始终是健康的。
+
+**账号池选号（均匀分布）**：新会话按「**日请求数 / 在途数最小者优先**，同负载按游标轮询打破平局」选号——负载相同时退化为纯轮询，负载偏斜时自动补给落后账号，各账号请求量长期趋近相等；单号并发（默认 2）与日总量（默认 1200）上限由 try_acquire 统一把关，满员自动跳过换号；已有会话保留**前缀亲和**（同一对话固定账号，护住上游 prompt 缓存），仅当该号不可用、日量耗尽或排队冷却时才改选。
 
 ```
 客户端 OpenAI 请求
@@ -158,16 +308,125 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 **低谷时段视觉高亮**：看板在低谷窗口（22:00-08:00）内把价签切换为**亮绿发光高亮块**——大号谷价 +「● 低谷生效中」徽标 + 峰价红色删除线 + 时段/折扣文案；非低谷时段显示常规「峰 x → 谷 x」并提示「低谷自 22:00 起」。判定用后端字段 + 浏览器本地时间即时复算双保险，跨窗口自动切换。
 
-同 key 跨区也可能不同（`mmodel` 国际=MiniMax-M3、国内=MiniMax-M2.7）；上下文窗口、倍率、视觉/推理标志逐项取自官方条目（如国内 `dmodel` 96000、国际 `dmodel` 1000000）。请求侧接受 key / 展示 id「key (Name)」/ 人类可读别名 / 官方显示名任意形式；区域独占模型（国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate` 等）自动路由到归属出口。
+同 key 跨区也可能不同（`mmodel` 国际=MiniMax-M3、国内=MiniMax-M2.7）；上下文窗口、倍率、视觉/推理标志逐项取自官方条目（如国内 `dmodel` 96000、国际 `dmodel` 1000000）。
 
-### 2. 稳定物理设备指纹隔离 (`derive_id`)
+**上下文窗口：默认值 ≠ 上限。** `context_config` 给出该模型的全部档位（通常
+200K / 400K / 1M，其中一档标 `is_default`）。此前把 `max_input_tokens`（GLM-5.3、
+Kimi-K3 等为 180000）当上限直接硬写，导致客户端显示「只有 180K」—— 而官方 App
+对同一模型提供 200K/400K/1M 滑块，历史流量里 GLM-5.3 也实际吃过 **466K** 输入。
+现在的口径：
+
+- `context_length` = **最大可选窗口**（滑块右端，即「能调到多大」）；
+- `context_window_default` = 官方默认档位（数值，token 数）；
+- 发给上游的 `model_config.max_input_tokens` = 官方默认档位，**可被客户端按请求
+  覆盖**：传 `context_window`（或 `max_input_tokens`）字段即可，值会**夹到该模型
+  的合法档位**（如 999999 → 400K）。两个字段都会被剔除、不污染转发体。
+
+```bash
+# 让本次请求按 1M 窗口发（GLM-5.3 支持 200K/400K/1M）
+curl -s localhost:8790/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"GLM-5.3","context_window":1000000,"messages":[{"role":"user","content":"hi"}]}'
+```请求侧接受 key / 展示 id「key (Name)」/ 人类可读别名 / 官方显示名任意形式；区域独占模型（国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate` 等）自动路由到归属出口。
+
+### 2. 拒绝与异常结束的规范化（`finish_reason`）
+
+上游会返回**规范外**的 `finish_reason`。实测见到 `refusal`（模型主动拒绝——
+其 system prompt 含安全条款，例如「Refuse to create, modify, or improve code
+that may be used maliciously」）。规范外值若原样透传，客户端无法归类，表现为
+异常状态提示。
+
+处置（三条不变式，均有回归测试）：
+
+1. **归一化**：规范外值映射到语义最近的标准值（`refusal` → `content_filter`，
+   未知值 → `stop`），并写一条 `finish_reason.mapped` 事件保留「原始值 → 归一值」，
+   使归一不丢信息。合法值原样通过。
+2. **请求必闭合**：拒绝类响应往往**不带 `usage`**，而 `record_usage` 原先在无
+   usage 时提前返回 —— 导致该请求在 `usage.jsonl` 与 `events.jsonl` 里**完全
+   不存在**，事后无法定位。现在无论有无 usage 都落一行并发出 `request.end`。
+3. **保留拒绝原因**：非流式响应的 `message.refusal` 与落盘行的 `refusal` 字段
+   都保留原文，客户端/排查者能知道「为何被拒」，而不是只看到空内容 + 异常状态。
+
+> 这是**模型自身的对齐行为**，网关无法阻止（客户端提供的 system prompt 会替换
+> 上游模板基座，替换后仍可能被拒）。网关能做的是：让拒绝**可归类、可追溯**。
+### 3. 孤儿 tool_calls 清理（否则工具调用会「持续失败」）
+
+上游对**配对不完整**的 tool_calls 直接返 400：
+
+```
+The provided messages input is invalid.
+The error info is [Can only get item pairs from a mapping.]
+```
+
+即 assistant 声明调用了某个 `tool_call` id，但缺少对应的 `role=tool` 结果 ——
+客户端截断历史、子代理被取消、工具执行中断都会造成。**单条孤儿会让整次请求
+失败**，而客户端每轮都带完整历史，于是该会话之后**每一轮都 400**，表现为
+「工具调用持续失败」而非偶发。
+
+处置（`cleanup_orphan_tool_calls`，在 `flatten_messages` 入口执行）：
+
+| 情形 | 处理 |
+|---|---|
+| 双侧齐全（有调用、有结果） | 原样保留 |
+| assistant 的 tool_calls 中**任一 id 未配对** | **整个 `tool_calls` 键删除**（保留 content） |
+| `role=tool` 结果**无对应调用** | **整条消息删除** |
+| 无工具消息的普通对话 | 零改动（不误伤） |
+
+触发清理时记一条 WARN 日志（含 req_id），便于事后统计发生频率。
+
+> 与 workbuddy 网关的 `cleanupOrphanToolCalls`（`internal/upstream/tool_pairing.go`）
+> 同语义 —— 该保护是两者行为差异的来源之一。
+### 4. 截断工具调用的清理（客户端报 `Unterminated string`）
+
+SSE 流被截断时（连接中断 / `finish_reason==length` / 上游超时），工具调用的
+`arguments` 会只剩**半截 JSON**。原样交给客户端会解析失败并卡死会话：
+
+```
+Validation failed for tool "edit": Tool call arguments are not valid JSON.
+Parse Error: Unterminated string
+```
+
+处置（`is_truncated_arguments` + `drop_truncated_tool_calls`，与 workbuddy 网关
+`internal/upstream/truncation.go` 同语义）：
+
+| arguments | 判定 | 理由 |
+|---|---|---|
+| 空串 / 纯空白 | **不是**截断 | 合法的无参工具 |
+| 非空但 JSON 解析失败 | **截断** | 分片丢失，残缺 |
+| 能解析（含 `null`/标量/数组） | **不是**截断 | 合法 JSON |
+
+**覆盖全部四条链路**（判定只看「参数能否解析」，不依赖 `finish_reason` 取值 ——
+连接中断/上游超时不会产生 finish_reason 帧，只看 `length` 会全部漏网）：
+
+| 链路 | 处置 |
+|---|---|
+| **chat 流式**（omp 主用，生产 590/673 次） | 新增 `iter_client_sse` 转发层：tool_calls 分片**按 index 缓冲**，收尾时逐 index 判定完整性 —— 可解析则按原顺序补发，残缺则整组丢弃。content/reasoning 仍即时透传。 |
+| chat 非流式聚合 | 丢弃残缺调用（WARN 日志）；全被丢弃时 `finish_reason` 降级 `stop` |
+| responses 流式 | 补发 `output_item.done`（`status: incomplete`）维持 added/done 配对；**不带 `arguments` 字段**（空串会被客户端解析成 `{}` 并执行）；整轮置 `incomplete` |
+| responses 非流式 | 丢弃残缺调用 |
+
+> **custom freeform 工具例外**：这类工具的载荷本就是自由文本（网关的
+> `CUSTOM_TOOL_HINT` 要求模型原样放入 `input`），不是 JSON，按「能否解析」
+> 判会误杀 —— 四条链路都对该类工具跳过截断判定。
+>
+> **控制流异常不得触发补发**：`UpstreamStatus`（排队/额度/瞬时信封）与
+> `GeneratorExit` 直接放行，否则先下发的缓冲帧会把 handler 的 `emitted`
+> 置真，导致 in-stream 排队等待与瞬时重开被静默关闭。
+>
+> **为什么流式必须缓冲**：SSE 分片一旦写出就无法撤回，而 arguments 是否完整
+> 只有到收尾才能判定。直接透传时半截 JSON 进入客户端累积 buffer，客户端在流
+> 结束时严格解析失败。缓冲仅影响 tool_calls 分片的**到达时间**（推迟到收尾），
+> 内容与直接透传等价；文本/思考帧不受影响，流式体验不变。
+
+> 残缺调用**丢弃**而非补成 `{}`：后者会伪造「合法」外观，让客户端误以为
+> 工具调用成功，掩盖了流被截断这一事实。
+### 5. 稳定物理设备指纹隔离 (`derive_id`)
 
 双区域统一方案：以账号 UID + 业务盐单向 MD5 派生固定 `machineId` / `sessionId` / `machineType` / `machineToken`，COSY 签名头逐请求携带：
 
 - **同一账号长期稳定**：出站请求永远来自同一台虚拟物理设备，规避机器码漂移风控；
 - **多账号天然隔离**：不同账号机器码彼此独立，阻断跨账号关联检测。
 
-### 3. 每日签到、额度与 Pro 福利包（官方能力门控：仅国内版）
+### 6. 每日签到、额度与 Pro 福利包（官方能力门控：仅国内版）
 
 - **每日签到**：`GET /sash/api/v1/me/daily-check-in/status` → 未签则 `POST …/claim`（+100 积分）；409 `ALREADY_CLAIMED` 归一化为「今日已签到」；上游活动停用（`status=DISABLED`）时诚实跳过、不硬领；签到后即时刷新额度快照；
 - **国际版官方无签到接口**：国际版账号在任务中心、批量签到、调度器中均被自动门控，不会发起无效请求；国际版仍可查询 `quota/usage` 额度与 `user/plan` 套餐；
@@ -175,14 +434,14 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - **Pro 福利包**：一次性 +1800 积分，`eligibility → claim` 两步走（端点 404 时视为活动未开放）；
 - **看板「签到与福利中心」**：连续签到天数、积分余额、福利包状态卡片 + 任务行表格，支持单账号/批量（仅国内视图显示，与官方能力一致）。
 
-### 4. 后台常驻定时调度器 (Scheduler)
+### 7. 后台常驻定时调度器 (Scheduler)
 
-- **每日 09:00 & 21:00**：全量自动签到（补签未签账号）+ 额度快照刷新；
+- **签到已移交 `qoder2api` 计划任务**（`D:\ai-servers\qoder2api\daily-checkin.ps1`，计划任务 `QoderDailyCheckin`，每日 10:01–10:15 随机时刻执行）。本网关**不执行任何签到**：两处签到只会争抢同一份每日额度（Qoder 按设备去重，重复领取返回 `SAME_PERSON_ALREADY_CLAIMED`）。看板「签到与福利中心」的按钮仍可手动单次触发，属排查用途；
 - **每日 22:00**：集中 Token 保活 —— `drt-` → `deviceToken/refresh`，`jrt-` → `jobToken/refresh`，失败回落 PAT 重新交换；
 - 任意巡检中对剩余寿命不足 4 小时的 Token 提前刷新；
 - **会话死亡识别**：上游 `TOKEN_EXPIRE` / `12153` / `Offline user session not found` → 自动停用账号并标注需重新登录。
 
-### 5. 凭证家族与生命周期
+### 8. 凭证家族与生命周期
 
 ```
 accessToken:   dt- (OAuth 设备流, ~30天)  或 jt- (PAT 交换, 24小时)
@@ -304,7 +563,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 - **[mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)**：
   - **Qoder 双区域合并插件**：CN/Intl 常量表、OAuth 设备授权与 PAT 交换流程、COSY 签名与自定义 Base64 编码的验证实现；
-  - **每日签到与保活排程设计**（09:00/21:00 签到 · 22:00 保活）、按 token 前缀路由的刷新策略。
+  - **每日签到与保活排程设计**（本网关保留 22:00 保活；签到改由 `qoder2api` 计划任务承担）、按 token 前缀路由的刷新策略。
 - **[Liki4/qodercli2api](https://github.com/Liki4/qodercli2api)**：
   - **Qoder OAuth 与推理协议逆向全记录**：设备流 PKCE 细节、`deviceToken`/`jobToken` 端点、SSE 信封与 `[DONE]`/`event:finish` 语义。
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)**：
