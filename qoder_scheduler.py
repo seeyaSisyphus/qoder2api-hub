@@ -1,8 +1,10 @@
 """qoder_scheduler.py —— 后台定时调度器 (Scheduler)
 
 负责常驻后台自动执行：
-1. 每日签到 (Daily Checkin)：每日 09:00 / 21:00 为所有账号自动签到领积分。
-2. 福利包巡检：签到巡检时顺带刷新额度与套餐快照。
+1. 每日签到 (Daily Checkin)：已移交 qoder2api 计划任务（daily-checkin.ps1 /
+   QoderDailyCheckin），本网关永不签到——同一账号在两处签到只会争抢同一份
+   每日额度（Qoder 按设备去重，重复领取返回 SAME_PERSON_ALREADY_CLAIMED）。
+2. 福利包巡检：巡检时顺带刷新额度与套餐快照。
 3. Token 保活 (Keepalive)：每日 22:00 集中刷新；另对剩余寿命不足 4 小时的
    账号在任意巡检中提前刷新（drt- / jrt- 按 token 前缀路由，PAT 兜底）。
 4. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
@@ -11,14 +13,15 @@ import threading
 import time
 
 import qoder_tasks
-from qoder_tasks import set_logger, run_batch_checkin, run_keepalive
+from qoder_tasks import set_logger, run_keepalive
 
 
 class Scheduler(object):
     def __init__(self, pool):
         self.pool = pool
         # 对齐社区默认排程 (本地时区 24 小时制)
-        self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
+        # 签到统一由 qoder2api 计划任务负责（见模块头注释）；本网关不签到。
+        self.checkin_hours = []
         self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活
         self.all_hours = sorted(set(self.checkin_hours + self.keepalive_hours))
         self.enabled = True
@@ -126,7 +129,6 @@ class Scheduler(object):
 
         cur_hour = time.localtime().tm_hour
         keepalive_due = cur_hour in self.keepalive_hours
-        checkin_due = cur_hour in self.checkin_hours
 
         # 1. Token 保活：整点 22:00 全量刷新；其余巡检只刷新临近过期的
         force = keepalive_due
@@ -138,27 +140,15 @@ class Scheduler(object):
             if line.startswith("!"):
                 self.log(line)
 
-        # 2. 每日签到：整点签到窗口内执行；其余巡检只补签未签账号
-        #    （官方能力：签到仅国内版 has_checkin=True）
-        from qoder_accounts import get_realm_config
-        targets = [a for a in self.pool.accounts
-                   if a.enabled and a.access_token
-                   and get_realm_config(a.realm)["has_checkin"]]
-        pending = targets if checkin_due else [a for a in targets if a.can_checkin()]
-        checkin_count = 0
-        earned = 0
-        if pending:
-            self.log("检测到 %d 个账号需要签到，执行自动签到..." % len(pending))
-            res = run_batch_checkin(pending, gap=1.0, inter_gap=1.0)
-            checkin_count = res["accounts_count"]
-            earned = res.get("credit_added") or 0
-            for line in res["logs"]:
-                if line.startswith("✓") or line.startswith("!"):
-                    self.log(line)
-        elif checkin_due:
-            self.log("所有账号今日已签到")
+        # 2. 每日签到：已移交 qoder2api 计划任务（daily-checkin.ps1）。
+        #    本网关永不领取签到额度，避免与计划任务争抢同一份每日福利
+        #    （重复领取只会返回 SAME_PERSON_ALREADY_CLAIMED）。
 
-        # 3. 刷新额度快照（看板积分卡片依赖）
+        # 3. 刷新额度快照（看板积分卡片依赖）：所有账号都刷——额度接口两个
+        #    realm 都支持；原先按 has_checkin 门控会把 intl 账号整体跳过，
+        #    纯 intl 池的巡检快照因此空转。
+        targets = [a for a in self.pool.accounts
+                   if a.enabled and a.access_token]
         for acc in targets:
             try:
                 acc.fetch_credits()
@@ -166,15 +156,15 @@ class Scheduler(object):
                 pass
             time.sleep(0.5)
 
-        self.log("巡检完成：Token 保活 %d 个，签到 %d 个，本次新增积分 +%d"
-                 % (ka["refreshed"], checkin_count, earned))
+        self.log("巡检完成：Token 保活 %d 个（签到由 qoder2api 计划任务负责）"
+                 % ka["refreshed"])
 
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到 · 22:00 Token 保活)",
-            "mode_cn": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
-            "mode_intl": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
+            "mode": "整点排程 (22:00 Token 保活；签到由 qoder2api 负责)",
+            "mode_cn": "整点排程 (22:00 Token 保活；签到由 qoder2api 计划任务负责)",
+            "mode_intl": "整点排程 (22:00 Token 保活；签到由 qoder2api 计划任务负责)",
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "logs": self.logs[-20:],
