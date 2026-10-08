@@ -9,7 +9,7 @@ COSY 推理签名会携带 cosy-machineid / cosy-machinetoken / cosy-machinetoke
 这里提供与 WorkBuddy 网关同构的稳定派生逻辑：
   - machineId  : 由 uid 稳定派生（同一账号永远相同）
   - sessionId  : 由 uid 稳定派生（会话隔离）
-  - request id : 稳定前缀 + 微秒时间戳（防重放且可溯源）
+  - request id : 每请求随机 UUID4（不带账号级恒定前缀，避免被聚类）
 """
 import hashlib
 import time
@@ -25,10 +25,14 @@ def derive_id(uid: str, salt: str) -> str:
 
 
 def generate_request_id(uid: str) -> str:
-    """生成带稳定前缀与微秒时间戳的防风控请求 ID。"""
-    prefix = derive_id(uid, "req")
-    suffix = str(time.time_ns() % 1000000).zfill(6)
-    return f"{prefix}-{suffix}"
+    """生成每个请求唯一的 request id（UUID4）。
+
+    原先用「uid 派生前缀 + 微秒时间戳」——同一账号所有业务请求共享同一恒定
+    前缀，可被一键聚类，且格式非 UUID，与官方客户端（每请求随机 UUID）不符。
+    这是每个业务请求都会带的头，收益高于多数改造项。
+    """
+    import uuid as _uuid
+    return str(_uuid.uuid4())
 
 
 def derive_machine_type(uid: str) -> str:
