@@ -2706,6 +2706,564 @@ def parse_dsml_tool_calls(text):
     return tool_calls, clean
 
 
+# DSML 起始标签的**增量**探测（流式路径用）：完整标签 + 允许的未完成前缀。
+# 模型把标签写成多帧（"<｜DS" 一帧、"ML｜calls>" 一帧）时，半截标签一旦透传
+# 出去就无法撤回 —— 故必须逐字符判定「还可能吗」，而不是等完整标签出现。
+# 竖线允许全角 ｜（官方形态）与半角 |（模型偶发手写）。
+_DSML_OPEN_RE = re.compile(r"<[|｜]?DSML[|｜]?calls>")
+_DSML_PARTIAL_RE = re.compile(r"<[|｜]?D?S?M?L?[|｜]?c?a?l?l?s?>?")
+
+
+def _dsml_open_state(pending):
+    """pending 以 "<" 开头时，判断它是否是（或可能长成）DSML 起始标签。
+
+    返回 "match"（起始标签已完整）/ "maybe"（仍可能是前缀，需更多字符）/
+    "no"（不可能 -> 立即按普通文本下发，不扣留内容）。
+    """
+    if not pending.startswith("<"):
+        return "no"
+    if _DSML_OPEN_RE.match(pending):
+        return "match"
+    m = _DSML_PARTIAL_RE.match(pending)
+    if m and m.end() == len(pending):
+        return "maybe"
+    return "no"
+
+
+def declared_tool_names(tools):
+    """客户端声明的工具名集合（Chat 的 function 包裹形态 + 顶层 name 形态）。
+
+    DSML 兜底据此白名单校验：解析出的 invoke 名必须**全部**在集合内才敢转成
+    结构化 tool_calls —— 否则会把模型随手写的文本变成客户端不认识的工具调用。
+    """
+    names = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        name = (fn.get("name") if isinstance(fn, dict) else "") or t.get("name") or ""
+        if name:
+            names.add(str(name))
+    return names
+
+
+# ---------------------------------------------------------------------------
+# 历史工具调用文本形态的「回读」（上游 issue #8/#9/#11/#16）
+# ---------------------------------------------------------------------------
+# 模型偶发把工具调用**按文本格式复述**进正文（而不是给结构化 tool_calls），
+# 客户端就会把这段内部协议文本当正文显示、本轮调用不执行：
+#   - issue #8 ：LEAK_MARKER + JSON 数组 [{name, arguments}, ...]
+#   - issue #11：TOOL_RESULT_MARKER + 工具结果正文（回声块）
+# 这里在严格守卫下还原成结构化 tool_calls，或按截断语义吞掉；chat 流式/非流式、
+# Responses 流式/非流式四条出口共用同一套判据。
+LEAK_MARKER = "[assistant 请求调用工具]"
+TOOL_RESULT_MARKER = "[工具结果"
+TOOL_RESULT_CLOSE = "[工具结果结束]"
+
+# issue #16-B1：跨帧补全窗口 = 最长标记长度 - 1（LEAK_MARKER 18 字符 -> 17）。
+# 只有帧/缓冲**末尾**的这 17 个字符内匹配到某个标记的真前缀时才暂留；
+# 下一帧一旦证伪立即补发（fail-open），不会无限压住正常文本。
+_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(TOOL_RESULT_MARKER)) - 1
+
+# issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
+# JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
+# 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
+_HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此）
+_HOLD_MAX_FRAMES = 200             # 极端"每帧 1 字符"场景的二级兜底
+
+
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
+    （整段都是该块）；未识别时原样返回 text。
+    """
+    t = (text or "").strip()
+    # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
+    if t.startswith("```") and t.endswith("```") and len(t) > 6:
+        inner = t[3:]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = inner[:-3].strip()
+    if not t.startswith(LEAK_MARKER):
+        return None, text
+    rest = t[len(LEAK_MARKER):].strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
+        return None, text
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return None, text
+    if not isinstance(arr, list) or not arr:
+        return None, text
+    calls = []
+    for item in arr:
+        if not isinstance(item, dict):
+            return None, text
+        name = item.get("name")
+        args = item.get("arguments")
+        if not isinstance(name, str) or not name.strip():
+            return None, text
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args, ensure_ascii=False)
+        if not isinstance(args, str):
+            return None, text
+        if args.strip():
+            try:
+                json.loads(args)
+            except Exception:
+                return None, text
+        calls.append({
+            "id": _new_id("call_"),
+            "type": "function",
+            "function": {"name": name.strip(), "arguments": args},
+        })
+    if allowed_names:
+        if not all(c["function"]["name"] in allowed_names for c in calls):
+            return None, text
+    return calls, ""
+
+
+def _leak_body_offset(text):
+    """把「marker 之前的围栏前缀 / marker 之后的正文」解析出来。
+
+    返回 (state, body)：state='pre'（还处在围栏/前缀区，未到 marker）、
+    state='body'（已越过 marker，body 为其后文本）、state='no'（显然不是）。
+    流式暂存与判真共用同一套前缀规则（含 ``` 与 ```json 围栏）。
+    """
+    t = (text or "").lstrip()
+    if not t or LEAK_MARKER.startswith(t):
+        return "pre", None
+    if t.startswith(LEAK_MARKER):
+        return "body", t[len(LEAK_MARKER):]
+    if not t.startswith("`"):
+        return "no", None
+    if len(t) < 3:
+        return ("pre", None) if "```".startswith(t) else ("no", None)
+    if not t.startswith("```"):
+        return "no", None
+    rest = t[3:]
+    low = rest.lstrip().lower()
+    if low.startswith("json"):
+        after = rest.lstrip()[4:].lstrip()
+    elif LEAK_MARKER.startswith(low) or low.startswith(LEAK_MARKER):
+        after = rest.lstrip()          # 无语言标记的 ``` 围栏
+    elif "json".startswith(low):
+        return "pre", None             # 语言标记还没打完（j/js/json）
+    else:
+        return "no", None
+    if LEAK_MARKER.startswith(after):
+        return "pre", None
+    if after.startswith(LEAK_MARKER):
+        return "body", after[len(LEAK_MARKER):]
+    return "no", None
+
+
+def _leak_prefix_hold(text):
+    """文本仍可能是泄漏块的前缀？（流式 hold-back 用）"""
+    return _leak_body_offset(text)[0] != "no"
+
+
+def _json_array_prefix_ok(text):
+    """text 是否仍可能扩展成合法 JSON 数组字面量（流式暂存判定用）。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if not s.startswith("["):
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        # 未闭合字符串的报错位置在字符串开头，但仍可继续扩展
+        if msg.startswith("Unterminated string"):
+            return True
+        pos = getattr(exc, "pos", None)
+        if pos is None:
+            return False
+        if msg.startswith("Invalid \\uXXXX escape"):
+            # issue #16-B3：截断落在未写完的转义里（"...\\u6" / "...\\u63a2"）。
+            # json.loads 的报错位置在**反斜杠**处而非末尾，旧的
+            # `pos >= len(s) - 1` 兜底会判 False -> 不吞 -> 泄漏。
+            # 「未写完」（hex 不足）与「彻底非法」（如 \\uZZZZ）在异常消息层面
+            # 无法区分，一律宽松 hold —— 流末仍会走吞掉/补发判定，宽松只影响
+            # 延迟、不改变最终结论。实测（Python 3.13）pos 指向 'u' 本身
+            # （如 s[pos-1] == "\\"）；为稳妥两种位置都检查。
+            return (s[max(0, pos - 1):pos + 1] == "\\u"
+                    or s[pos:pos + 2] == "\\u")
+        if msg.startswith("Extra data"):
+            # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
+            tail = s[pos:].strip()
+            return (not tail) or "```".startswith(tail)
+        # 语法错误点落在末尾（未闭合括号等）→ 还允许继续扩展
+        return pos >= len(s) - 1
+
+
+def _find_marker_split(text, allow_prefix=True):
+    """把正文切成 (立即发出, 暂存候选)：在首个完整标记处切开（issue #16-B1）。
+
+    - 命中完整标记 -> (标记之前的散文, 标记及其后)；
+    - allow_prefix=True 且**末尾**是某标记的真前缀（长度 < 标记）时，把这段
+      前缀留给下一帧（跨帧补全窗口 _MARKER_HOLD_WINDOW）；
+    - 无命中 -> (text, "")。
+
+    背景：服务端 delta 切分不可控，"散文 + marker" 可能落在同一帧，而
+    _leak_prefix_hold 只认「整帧以标记开头」-> 整帧被透传 -> 泄漏。
+    """
+    t = text or ""
+    if not t:
+        return "", ""
+    best = -1
+    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+        i = t.find(mk)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    if best != -1:
+        return t[:best], t[best:]
+    if not allow_prefix:
+        return t, ""
+    tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
+    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+        for n in range(min(len(tail), len(mk) - 1), 0, -1):
+            if tail.endswith(mk[:n]):
+                return t[:-n], t[-n:]
+    return t, ""
+
+
+def _still_leak_candidate(text):
+    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
+    state, body = _leak_body_offset(text)
+    if state == "pre":
+        return True
+    if state == "no":
+        return False
+    rest = (body or "").lstrip()
+    if not rest:
+        return True
+    if rest.endswith("```"):
+        rest = rest[:-3]
+    return _json_array_prefix_ok(rest)
+
+
+def _leaked_partial_droppable(text, allowed_names=None):
+    """issue #9：正文是网关自己写入历史的工具调用回声、但被截断（JSON 不完整/
+    非法）时，应吞掉整段而不是透传给终端用户。三个条件同时成立才吞：
+      1) strip 后以 LEAK_MARKER 开头（真实散文回复几乎不会这样开头）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与恢复路径同前置条件；
+      3) marker 之后（剥掉围栏后）仍是 JSON 数组字面量的前缀
+         （复用现成的 _json_array_prefix_ok）——即"本该是数组，只是没写完"。
+    返回 True = 应吞掉正文（输出空 content）。
+
+    完整且合法的 JSON 数组不算：那种情况下恢复失败另有原因（工具名未声明 /
+    arguments 非法），保持既有 fail-open 透传语义（"未声明工具名 -> 不吞正文"），
+    只有"数组本身没写完 / 非法"才吞。
+    """
+    if not text or not allowed_names:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    if t == LEAK_MARKER:
+        # 只有 marker、连数组都没开始写：判据 3 的退化情形，同样是回声。
+        return True
+    state, body = _leak_body_offset(t)
+    if state != "body":
+        return False
+    rest = (body or "").strip()
+    if rest.endswith("```"):
+        rest = rest[:-3].strip()
+    if not _json_array_prefix_ok(rest):
+        return False
+    try:
+        json.loads(rest)
+        return False
+    except Exception:
+        return True
+
+
+def _tool_echo_head(text):
+    """切分「[工具结果<name>]」开标记行 → (body, ok)；ok=False 表示不是合法开标记。"""
+    t = (text or "").strip()
+    if not t.startswith(TOOL_RESULT_MARKER):
+        return None, False
+    rest = t[len(TOOL_RESULT_MARKER):]
+    close = rest.find("]")
+    if close == -1 or "\n" in rest[:close]:
+        return None, False          # 标记行未闭合 / 换行后才有 ]：非本网关形态
+    return rest[close + 1:], True
+
+
+def _tool_echo_droppable(text, allowed_names=None):
+    """issue #11：正文是「[工具结果...]」回声块时吞掉整段（与 issue #9 同形态）。
+
+    三个条件同时成立才吞：
+      1) strip 后是合法开标记行（TOOL_RESULT_MARKER + 可选 name + ]）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与既有回读同一前置；
+      3) 形态自洽：出现模型自造的闭标记 TOOL_RESULT_CLOSE，或标记之后（忽略空白）
+         以 JSON/标签起始字符开头（含被截断、永不闭合的块）。
+
+    为什么吞掉而不是还原成 tool 消息：还原需要把回声与历史上的 tool_call_id
+    配对，本轮只做「不把内部协议文本交给终端用户」。
+
+    不吞（fail-open）：不以标记开头；标记后跟自然语言散文；未声明 tools。
+    """
+    if not text or not allowed_names:
+        return False
+    body, ok = _tool_echo_head(text)
+    if not ok:
+        return False
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True                 # 只有开标记：退化形态（与 #9 的纯 marker 一致）
+    return rest[0] in "{[\"<"
+
+
+def _tool_echo_prefix_hold(text):
+    """流式 hold-back：这段缓冲仍可能是 issue #11 的回声块吗？（宽松版判据）"""
+    t = (text or "").lstrip()
+    if not t:
+        return True
+    if TOOL_RESULT_MARKER.startswith(t):
+        return True                 # 标记本身还没打完
+    body, ok = _tool_echo_head(t)
+    if not ok:
+        return False                # 不是标记形态 -> 证伪，立即放行
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True
+    return rest[0] in "{[\"<"
+
+
+def _echo_hold_candidate(text):
+    """统一暂存判定：仍可能是 #8 数组回声或 #11 工具结果回声？"""
+    return _still_leak_candidate(text) or _tool_echo_prefix_hold(text)
+
+
+def _leak_chunk_frame(meta, delta, finish_reason=None):
+    """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
+    payload = {
+        "id": meta.get("id") or "chatcmpl-qoder",
+        "object": "chat.completion.chunk",
+        "created": meta.get("created") or int(time.time()),
+        "model": meta.get("model") or "",
+        "choices": [{"index": 0, "delta": delta,
+                     "finish_reason": finish_reason}],
+    }
+    return ("data: " + json.dumps(payload, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _frame_without_content(payload):
+    """复制一帧并去掉 delta.content（保留 tool_calls/reasoning/收尾信息）。"""
+    out = dict(payload)
+    choices = []
+    for ch in payload.get("choices") or []:
+        if not isinstance(ch, dict):
+            choices.append(ch)
+            continue
+        ch2 = dict(ch)
+        delta = ch2.get("delta")
+        if isinstance(delta, dict) and "content" in delta:
+            d2 = dict(delta)
+            d2.pop("content", None)
+            ch2["delta"] = d2
+        choices.append(ch2)
+    out["choices"] = choices
+    return out
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None):
+    """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
+    成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
+
+    与 parse_leaked_tool_calls 同一套严格守卫，另加：
+      - 只有当已输出的正文仍是该块的「前缀/候选」时才暂存（期间不发正文）；
+      - 候选被证伪（出现别的字 / JSON 非法）→ 立刻把暂存整段补发为正文；
+      - 收尾帧暂存到流末，识别成功时改写 finish_reason=tool_calls；
+      - 上游控制流异常（UpstreamStatus = 排队/额度重开信号）直接放行、不补发：
+        补发会污染 handler 的 emitted，关掉流内排队与瞬时重开；
+      - 其它中断（断连/超时）先把**非**泄漏候选的暂存补发（宁可多吐一段正文，
+        也不闷掉正常文本），泄漏候选仍按截断语义丢弃。
+
+    客户端**没声明任何工具**时整层直通（不暂存、不还原、不吞）——与本地 DSML
+    兜底同一口径：没有声明集合就无从校验白名单，宁可 fail-open 把文本交给用户，
+    也不凭空造出客户端不认识的 tool_calls。
+    """
+    if not allowed_names:
+        for raw in frames:
+            yield raw
+        return
+    hold = None          # 正在暂存的候选正文（None = 未暂存）
+    hold_frames = 0      # hold 已累积的帧数（上限兜底用，issue #16）
+    finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
+    recovered = False
+    meta = {"id": None, "model": None, "created": None}
+
+    try:
+        for raw in frames:
+            text = (raw.decode("utf-8", "replace")
+                    if isinstance(raw, bytes) else raw)
+            data = strip_data_prefix(text)
+            payload = None
+            if data and data != "[DONE]":
+                try:
+                    payload = json.loads(data)
+                except Exception:
+                    payload = None
+            if not isinstance(payload, dict):
+                yield raw
+                continue
+            if payload.get("id"):
+                meta["id"] = payload["id"]
+            if payload.get("model"):
+                meta["model"] = payload["model"]
+            if payload.get("created"):
+                meta["created"] = payload["created"]
+            choices = payload.get("choices") or []
+            choice = (choices[0] if choices and isinstance(choices[0], dict)
+                      else {})
+            delta = choice.get("delta") or {}
+            piece_raw = delta.get("content")
+            piece = piece_raw if isinstance(piece_raw, str) else ""
+            fin = choice.get("finish_reason")
+            if piece_raw is not None and not isinstance(piece_raw, str):
+                # 非字符串 content（罕见）：不参与暂存判断，原样透传
+                if hold is not None:
+                    yield _leak_chunk_frame(meta, {"content": hold})
+                    hold = None
+                    hold_frames = 0
+                yield raw
+                continue
+            if hold is not None:
+                hold += piece
+                hold_frames += 1
+                if _echo_hold_candidate(hold):
+                    # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
+                    if len(hold) > _HOLD_MAX_CHARS \
+                            or hold_frames > _HOLD_MAX_FRAMES:
+                        log("released oversized leak hold (%d chars / %d frames) "
+                            "- fail-open" % (len(hold), hold_frames),
+                            level="WARN", tag="chat")
+                        yield _leak_chunk_frame(meta, {"content": hold})
+                        hold = None
+                        hold_frames = 0
+                        if fin:
+                            finished = (_frame_without_content(payload), fin)
+                        continue
+                    if fin:
+                        # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧
+                        # 必须去掉 content，否则同一段内容会被发两次（issue #16）。
+                        finished = (_frame_without_content(payload), fin)
+                    elif (delta.get("tool_calls")
+                          or delta.get("reasoning_content")
+                          or delta.get("refusal")
+                          or delta.get("role")):
+                        other = _frame_without_content(payload)
+                        yield ("data: "
+                               + json.dumps(other, ensure_ascii=False)
+                               + "\n\n").encode("utf-8")
+                    continue
+                # 证伪：暂存整段补发为普通正文
+                yield _leak_chunk_frame(meta, {"content": hold})
+                hold = None
+                hold_frames = 0
+                if fin:
+                    # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧必须
+                    # 去掉 content，否则同一段内容会被发两次（issue #16）。
+                    finished = (_frame_without_content(payload), fin)
+                continue
+            if fin and not piece:
+                finished = (payload, fin)
+                continue
+            if piece:
+                # issue #16-B1：散文与 marker 落在同一帧时，_leak_prefix_hold
+                # 对整帧判 False（它要求 lstrip 后以标记开头）-> 整帧透传 -> 泄漏。
+                # 这里先按标记切分：标记之前的散文**立即发出**（不拖首字延迟），
+                # 标记及其后进既有 hold 流程；帧尾的真前缀也在这里被暂留。
+                _emit16, _hold16 = _find_marker_split(piece)
+                if _hold16:
+                    if _emit16:
+                        yield _leak_chunk_frame(meta, {"content": _emit16})
+                    hold = _hold16
+                    hold_frames = 1
+                    if fin:
+                        finished = (_frame_without_content(payload), fin)
+                    continue
+                if _leak_prefix_hold(piece) or _tool_echo_prefix_hold(piece):
+                    hold = piece
+                    hold_frames = 1
+                    if fin:
+                        finished = (_frame_without_content(payload), fin)
+                    continue
+                # 未改动：原帧透传。**不要**重建帧 —— 同一帧可能还带
+                # reasoning_content / refusal / tool_calls 等字段，重建会丢。
+                yield raw
+                continue
+            yield raw
+    except (UpstreamStatus, GeneratorExit):
+        raise
+    except BaseException:
+        # 断连/超时等：先把**非**泄漏候选的暂存按普通正文补发（本地口径：
+        # 中断不闷掉正常文本），泄漏候选/回声块按截断语义丢弃；随后原样放行
+        # 异常，交给上层 iter_client_sse 补发它自己的 tool_calls 缓冲。
+        if hold is not None and not _leaked_partial_droppable(
+                hold, allowed_names) and not _tool_echo_droppable(
+                hold, allowed_names):
+            try:
+                yield _leak_chunk_frame(meta, {"content": hold})
+            except Exception:
+                pass
+        hold = None
+        raise
+
+    if hold is not None:
+        calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        if calls:
+            recovered = True
+            for i, call in enumerate(calls):
+                yield _leak_chunk_frame(meta, {"tool_calls": [{
+                    "index": i,
+                    "id": call.get("id"),
+                    "type": call.get("type") or "function",
+                    "function": call.get("function") or {},
+                }]})
+            if clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
+        elif _leaked_partial_droppable(hold, allowed_names):
+            # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
+            # 绝不把网关内部协议文本透传给终端用户。
+            log("dropped truncated leaked tool-call echo (%d chars) - issue #9"
+                % len(hold), level="WARN", tag="chat")
+        elif _tool_echo_droppable(hold, allowed_names):
+            # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
+            # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
+            log("dropped leaked tool-result echo (%d chars) - issue #11"
+                % len(hold), level="WARN", tag="chat")
+        else:
+            yield _leak_chunk_frame(meta, {"content": hold})
+    if finished is not None:
+        payload, fin = finished
+        if recovered:
+            payload = json.loads(json.dumps(payload))
+            for ch in payload.get("choices") or []:
+                if isinstance(ch, dict) and ch.get("finish_reason"):
+                    ch["finish_reason"] = "tool_calls"
+        yield ("data: " + json.dumps(payload, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    elif recovered:
+        yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
 # ---------------------------------------------------------------------------
 # Qoder 数据面：请求体构造
 # ---------------------------------------------------------------------------
@@ -3032,11 +3590,20 @@ def build_qoder_body(payload, account, model_key, realm=None):
     tmpl_system = [m for m in (body.get("messages") or [])
                    if (m or {}).get("role") == "system"]
     if system_text is None:
-        # 客户端没给 system：优先用 --system-prompt 覆盖值（非默认时），
-        # 否则保留模板自带的 Qoder 系统提示词。
+        # 客户端没给 system：优先用 --system-prompt 覆盖值（非默认时）；
+        # 其次看客户端是否自带工具 —— 带工具（edit/Bash/...）的客户端**绝不能**
+        # 继承模板自带的 Qoder CLI 系统提示词：那 12KB 里教的是 Qoder 桌面端
+        # 内置工具的用法（Task/TodoWrite/Edit/...）与桌面端语境（Working
+        # directory: D:/Projects/Qoder 等），模型会照着它写 Qoder 形态的调用，
+        # 与客户端实际声明的工具 schema 不符（实测表现为非法工具 payload、
+        # 半截/错位的 arguments）。此时用 SYSTEM_PROMPT（默认值也可）作中性
+        # 基座，工具定义完全以客户端 tools 为准。
         if SYSTEM_PROMPT and SYSTEM_PROMPT != DEFAULT_SYSTEM_PROMPT:
             system_text = SYSTEM_PROMPT
+        elif payload.get("tools"):
+            system_text = SYSTEM_PROMPT or DEFAULT_SYSTEM_PROMPT
         else:
+            # 既无 system 也无工具：保持原行为（保留模板的 Qoder 提示词）
             body["messages"] = tmpl_system
     if system_text is not None:
         body["messages"] = [{"role": "system", "content": system_text}]
@@ -4166,6 +4733,137 @@ def open_upstream(payload, session_key=None, target_realm=None,
         % realm)
 
 
+# ---------------------------------------------------------------------------
+# 上游 SSE 帧重组（社区实测：Qoder 网关会把一帧从 JSON 中间切断）
+# ---------------------------------------------------------------------------
+# agent 端点与 api2-v2 都实测到：约 3% 的事件被从 JSON 中间切断、注入裸换行，
+# 续行可能没有 `data:` 前缀，甚至切在 `data:` 前缀内部（`data\n: {...}`）。
+# 逐行读取时半截 JSON 解析失败 -> 整帧被静默丢弃；丢的若是带 id/name 的工具头
+# 帧，客户端只剩参数增量，报 "tool call delta is missing id or name"。
+# 参考实现：zenodinh/pi-provider-qoder#12（按空行分块、块内行先拼接再剥 data:
+# 前缀 —— 依据是「合法 JSON 里不可能出现裸换行」，故块内拼接必须**无分隔符**）、
+# saulgoodgirl/QoderGateway#12（载荷解析不了就缓存拼续行，始终闭合不了则丢弃）。
+_SSE_BLOCK_MAX = 1024 * 1024        # 单块缓存上限：超限 fail-open，绝不无限缓存
+
+
+def _sse_noise_line(line):
+    """与载荷无关的帧行（注释/心跳、事件名、id/retry 提示）。"""
+    t = (line or "").lstrip()
+    return (not t or t.startswith(":")
+            or t.startswith("event:") or t.startswith("id:")
+            or t.startswith("retry:"))
+
+
+def _sse_payload_ok(line):
+    """这一行单独就是一条完整可用的数据帧？（JSON 载荷 / [DONE] / 心跳）"""
+    data = strip_data_prefix(line)
+    if not data or data == "[DONE]":
+        return True
+    try:
+        json.loads(data)
+        return True
+    except Exception:
+        return False
+
+
+def _iter_sse_raw_lines(resp):
+    """按**字节流**语义切行：跨 item 续接半行，保留真正的空行分隔符。
+
+    不能对每个 item 直接 rstrip/split：行迭代器的切分点不可控，一个 item 里
+    可能含多行、也可能是没有换行结尾的半行；item 末尾的那个 "\\n" 不产生
+    空行（空行只在两个 "\\n" 相邻时才存在）。
+    """
+    carry = ""
+    for raw in resp:
+        if isinstance(raw, bytes):
+            try:
+                text = raw.decode("utf-8")
+            except Exception:
+                continue
+        else:
+            text = raw
+        parts = (carry + text).split("\n")
+        carry = parts.pop()          # 最后一段还没见到换行（可能是空串）
+        for line in parts:
+            yield line.rstrip("\r")
+    if carry:
+        yield carry.rstrip("\r")
+
+
+def _reframe_sse_lines(resp):
+    """把上游行流重组成「一帧一行」：断帧按空行分块、块内无分隔符拼接。
+
+    为什么无分隔符：注入的裸换行不在原始载荷里（合法 JSON 不可能含裸换行），
+    块内各行按原字节顺序直接相连才是原帧。分块依据是空行（SSE 事件分隔符），
+    且**先拼接、后剥前缀**，所以切在 `data:` 前缀内部也能还原。
+
+    解析不了的行不即时透传（半截 JSON 透传下去就是客户端解析失败）：缓存并
+    拼后续行；始终闭合不了的按截断语义**丢弃**并记事件日志 —— 流末仍未决、
+    超长、或新行自身已是完整帧（旧块再也不会闭合）三种情形都算。
+    正常帧（能独立解析）逐行即时放行，不引入额外延迟。
+    """
+    buf = ""            # 未决块（块内多行已按原字节顺序拼接）
+    repaired = 0        # 拼接修复次数
+    dropped = 0         # 无法闭合而丢弃的块数
+    try:
+        for line in _iter_sse_raw_lines(resp):
+            if not line.strip():
+                # 空行 = 事件分隔符：交出当前块（未闭合的按截断语义丢弃）
+                if buf:
+                    if _sse_payload_ok(buf):
+                        repaired += 1
+                        yield buf
+                    else:
+                        dropped += 1
+                        log("incomplete SSE frame dropped (%d chars)"
+                            % len(buf), level="WARN", tag="chat")
+                    buf = ""
+                continue
+            if not buf:
+                if _sse_noise_line(line) or _sse_payload_ok(line):
+                    yield line
+                    continue
+                buf = line               # 解析不了：先缓存，等续行
+                continue
+            # 已有未决块。新行自身若是完整数据帧，旧块再也不会闭合 -> 丢弃旧块。
+            # 注释/事件名行不算（`data\n: {...}` 这种切在 data: 前缀内部的续行
+            # 正是以 ":" 开头，必须当续行拼）。
+            if _sse_payload_ok(line) and not _sse_noise_line(line):
+                dropped += 1
+                log("incomplete SSE frame dropped (%d chars)" % len(buf),
+                    level="WARN", tag="chat")
+                buf = ""
+                yield line
+                continue
+            cand = buf + line
+            if len(cand) > _SSE_BLOCK_MAX:
+                dropped += 1
+                log("oversized SSE frame dropped (%d chars)" % len(cand),
+                    level="WARN", tag="chat")
+                buf = ""
+                continue
+            buf = cand
+            if _sse_payload_ok(buf):
+                repaired += 1
+                yield buf
+                buf = ""
+        if buf:
+            if _sse_payload_ok(buf):
+                # 流末刚好缺一个空行：块本身是完整帧，照常交出
+                repaired += 1
+                yield buf
+            else:
+                # 流末仍未决：按截断语义丢弃（半截 JSON 绝不透传）
+                dropped += 1
+                log("incomplete SSE frame dropped at end of stream (%d chars)"
+                    % len(buf), level="WARN", tag="chat")
+    finally:
+        # 计数必须走 finally：下游 iter_inner_sse 见到 [DONE] 就 break，
+        # 生成器被 close()（GeneratorExit），走不到函数末尾。
+        if repaired or dropped:
+            _write_event("sse.reframe", repaired=repaired, dropped=dropped)
+
+
 def iter_inner_sse(resp, holder=None):
     """把上游 SSE 信封流解包成标准 OpenAI chunk 的 "data: ..." 行。
 
@@ -4178,15 +4876,14 @@ def iter_inner_sse(resp, holder=None):
       - statusCodeValue != 200 -> 抛 UpstreamStatus（body 为错误详情）
       - body == "[DONE]"       -> 结束迭代
       - 内层 chunk 里的 usage 记入 holder
+      - 行先经 _reframe_sse_lines 重组（上游会把一帧从 JSON 中间切断）
     """
-    for raw in resp:
-        if isinstance(raw, bytes):
+    for line in _reframe_sse_lines(resp):
+        if isinstance(line, bytes):
             try:
-                line = raw.decode("utf-8")
+                line = line.decode("utf-8")
             except Exception:
                 continue
-        else:
-            line = raw
         data = strip_data_prefix(line)
         if not data:
             continue
@@ -4253,7 +4950,8 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def iter_client_sse(resp, holder=None, custom_names=None):
+def iter_client_sse(resp, holder=None, custom_names=None,
+                    allowed_tool_names=None, inner_lines=None):
     """iter_inner_sse 的转发层：对 tool_calls 分片做**截断防护**后逐帧下发。
 
     为什么必须缓冲：SSE 分片一旦写出就无法撤回，而 arguments 是否完整只有到
@@ -4269,13 +4967,121 @@ def iter_client_sse(resp, holder=None, custom_names=None):
 
     覆盖场景：`finish_reason==length`、上游断连、以及**任何**没有 finish_reason
     就结束的流 —— 判定只看「拼出的参数能否解析」，不依赖 finish_reason 取值。
+
+    allowed_tool_names（DSML 兜底，与 /v1/responses 对齐）：客户端声明了工具
+    名单时，模型若把调用写成 DeepSeek 风格的 `<｜DSML｜calls>` 文本而非结构化
+    tool_calls，则在流收尾把该文本转成 tool_calls 分片下发（**仅当**解析出的
+    invoke 名全在名单内）。content 在 DSML 起始候选之前即时透传，候选之后暂存
+    到收尾；默认 None = 不做兜底（旧调用方行为不变）。
+
+    inner_lines：已解包的上游 chunk 行迭代器（iter_inner_sse 的输出，可能已被
+    recover_leaked_tool_calls 过滤）。给定时不再从 resp 解包 —— 泄漏回读必须
+    在**本层之前**接上，这样它还原出的 tool_calls 同样过本层的截断校验与
+    白名单；否则同一份上游流会被解包两次（内层 chunk 被当信封解析）。
     """
     buf = {}        # index -> [(line_bytes, args_fragment), ...]
     order = []      # index 首次出现顺序
     names = {}      # index -> 工具名（判定 custom freeform 用）
+    dsml_names = set(allowed_tool_names or ())
+    dsml_on = bool(dsml_names)      # 无声明工具 -> 不做 DSML 兜底
+    tc_emitted = False              # 本轮是否已向客户端下发结构化 tool_calls
+    dsml_pending = ""               # "<" 起、尚未确认的起始候选（暂存）
+    dsml_mode = False               # 已确认起始标签，进入 DSML 累积模式
+    dsml_buf = ""                   # 累积的 DSML 文本块（含起始标签）
+    # 补发帧的信封：沿用上游最近一帧的 id/object/created/model（客户端按帧
+    # 累积，缺字段会解析失败）。
+    meta = {"id": "chatcmpl-qoder", "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": (holder or {}).get("model") or ""}
+
+    def _chunk_frame(delta, finish=None):
+        frame = dict(meta)
+        frame["object"] = "chat.completion.chunk"   # 上游若是非 chunk 形态也纠正
+        frame["choices"] = [{"index": 0, "delta": delta,
+                             "finish_reason": finish}]
+        return ("data: " + json.dumps(frame, ensure_ascii=False)
+                + "\n\n").encode("utf-8")
+
+    def _feed_content(piece):
+        """喂入一段 content，返回**可立即下发**的普通文本。
+
+        增量匹配器只做前缀相容判定：不相容立即补发（普通文本里的 "<" 最多
+        延迟一个片段，不会被长期扣留）；相容则暂存等后续字符；起始标签一旦
+        完整，转入累积模式 —— 该轮后续 content 全部暂存，收尾统一转换/补发。
+        """
+        nonlocal dsml_pending, dsml_mode, dsml_buf
+        out = []
+        while piece:
+            if dsml_mode:
+                dsml_buf += piece
+                return "".join(out)
+            if dsml_pending:
+                dsml_pending += piece
+                state = _dsml_open_state(dsml_pending)
+                if state == "match":
+                    dsml_mode = True
+                    dsml_buf += dsml_pending
+                    dsml_pending = ""
+                elif state == "no":
+                    out.append(dsml_pending)
+                    dsml_pending = ""
+                return "".join(out)
+            idx = piece.find("<")
+            if idx == -1:
+                out.append(piece)
+                return "".join(out)
+            if idx:
+                out.append(piece[:idx])
+            piece = piece[idx:]
+            state = _dsml_open_state(piece)
+            if state == "match":
+                dsml_mode = True
+                dsml_buf += piece
+                piece = ""
+            elif state == "no":
+                out.append(piece)
+                piece = ""
+            else:
+                dsml_pending = piece
+                piece = ""
+        return "".join(out)
+
+    def _dsml_finalize(convert=True):
+        """DSML 暂存收尾：返回 (补发帧, 是否转成了 tool_calls)。
+
+        convert=False（异常中断路径）只按普通文本补发 —— 断流时不再把文本
+        当可信调用下发。本轮已有结构化 tool_calls 时同样只补文本。
+        """
+        nonlocal dsml_pending, dsml_mode, dsml_buf
+        text = dsml_buf + dsml_pending
+        dsml_buf, dsml_pending, dsml_mode = "", "", False
+        if not text:
+            return [], False
+        if convert and not tc_emitted:
+            calls, clean = parse_dsml_tool_calls(text)
+            if calls and all((c.get("name") or "") in dsml_names
+                             for c in calls):
+                frames = []
+                if clean:
+                    frames.append(_chunk_frame({"content": clean}))
+                for i, c in enumerate(calls):
+                    frames.append(_chunk_frame({"tool_calls": [
+                        {"index": i, "id": c.get("id") or _new_id("call_"),
+                         "type": "function",
+                         "function": {"name": c.get("name") or "",
+                                      "arguments": ""}}]}))
+                    frames.append(_chunk_frame({"tool_calls": [
+                        {"index": i, "function": {
+                            "arguments": c.get("arguments") or "{}"}}]}))
+                log("DSML fallback: %d tool call(s) recovered from content"
+                    % len(calls), tag="chat")
+                return frames, True
+        # 未命中（无块 / 名字不在客户端声明的工具集内）：原文补发，不吞内容
+        return [_chunk_frame({"content": text})], False
 
     def _flush():
         """补发缓冲的 tool_calls 分片（逐 index 判定完整性）。"""
+        nonlocal tc_emitted
         out = []
         for idx in order:
             frames = buf.get(idx) or []
@@ -4297,11 +5103,14 @@ def iter_client_sse(resp, holder=None, custom_names=None):
         buf.clear()
         del order[:]
         names.clear()
+        if out:
+            tc_emitted = True
         return out
 
     _flush.dropped = False
 
-    _src = iter_inner_sse(resp, holder=holder)
+    _src = (inner_lines if inner_lines is not None
+            else iter_inner_sse(resp, holder=holder))
     try:
         for line in _src:
             try:
@@ -4315,12 +5124,17 @@ def iter_client_sse(resp, holder=None, custom_names=None):
             if not isinstance(obj, dict) or not isinstance(obj.get("choices"), list):
                 yield line
                 continue
+            for _k in ("id", "object", "created", "model"):
+                if obj.get(_k) is not None:
+                    meta[_k] = obj[_k]
             _chs = obj.get("choices") or []
             choice = _chs[0] if _chs and isinstance(_chs[0], dict) else {}
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 yield line
                 continue
+            _fr = choice.get("finish_reason")
+            _strip_tcs = False
             tcs = delta.get("tool_calls")
             if isinstance(tcs, list) and tcs:
                 _buffered = False
@@ -4345,35 +5159,61 @@ def iter_client_sse(resp, holder=None, custom_names=None):
                 if not _buffered:
                     yield line
                     continue
-                if choice.get("finish_reason"):
-                    # 收尾帧自身携带 tool_calls（少见）：先剥离该帧的 tool_calls
-                    # 再补发缓冲 —— 否则同一 index 会下发两遍（追加式客户端会
-                    # 重复拼接）。
-                    _stripped = json.loads(json.dumps(obj))
-                    _ch = (_stripped.get("choices") or [{}])[0]
-                    if isinstance(_ch, dict):
-                        (_ch.get("delta") or {}).pop("tool_calls", None)
+                if not _fr:
+                    continue
+                # 收尾帧自身携带 tool_calls（少见）：稍后剥离该帧的 tool_calls
+                # 再补发缓冲 —— 否则同一 index 会下发两遍（追加式客户端会
+                # 重复拼接）。
+                _strip_tcs = True
+            # ---- DSML 兜底：content 起始探测 / 暂存 ----
+            _emit = None
+            if dsml_on:
+                _piece = delta.get("content")
+                if isinstance(_piece, str) and _piece:
+                    _emit = _feed_content(_piece)
+            if _fr:
+                # 收尾：先把所有暂存判定并补发，再下发收尾帧（必要时改写）。
+                _override = None
+                if buf:
                     for _ln in _flush():
                         yield _ln
-                    yield ("data: " + json.dumps(_stripped, ensure_ascii=False)
-                           + "\n\n").encode("utf-8")
-                continue
-            if choice.get("finish_reason") and buf:
-                # 正常收尾：先把缓冲的 tool_calls 判定并补发，再下发收尾帧。
-                # 若本轮有调用因截断被丢弃，且上游给的是 tool_calls，则把收尾帧
-                # 降级为 length —— 否则客户端只看到 finish=tool_calls 却收不到
-                # 任何 tool_calls，会一直等工具结果而空转（与非流式路径的降级
-                # 处置对齐）。
-                for _ln in _flush():
-                    yield _ln
-                if _flush.dropped and choice.get("finish_reason") == "tool_calls":
+                    # 本轮有调用因截断被丢弃 -> 收尾帧一律降级为 length（不只是
+                    # tool_calls 时）。与非流式路径口径一致：残缺调用意味着这一轮
+                    # 不可信，客户端应重试/续写，而非把 stop 当「正常结束」。
+                    if _flush.dropped and _fr in ("tool_calls", "stop"):
+                        _override = "length"
+                if dsml_on and (dsml_mode or dsml_pending):
+                    _frames, _converted = _dsml_finalize()
+                    for _f in _frames:
+                        yield _f
+                    if _converted and not _override:
+                        _override = "tool_calls"
+                if _strip_tcs or _override or (
+                        _emit is not None and _emit != _piece):
                     _fixed = json.loads(json.dumps(obj))
-                    _c2 = (_fixed.get("choices") or [{}])[0]
-                    if isinstance(_c2, dict):
-                        _c2["finish_reason"] = "length"
+                    _c = (_fixed.get("choices") or [{}])[0]
+                    if isinstance(_c, dict):
+                        if _strip_tcs:
+                            (_c.get("delta") or {}).pop("tool_calls", None)
+                        if _emit is not None and isinstance(_c.get("delta"), dict):
+                            _c["delta"]["content"] = _emit
+                        if _override:
+                            _c["finish_reason"] = _override
                     yield ("data: " + json.dumps(_fixed, ensure_ascii=False)
                            + "\n\n").encode("utf-8")
                     continue
+                yield line
+                continue
+            # 非收尾帧：content 被裁剪时按裁剪后的内容重建（其余字段原样保留 ——
+            # 同一帧可能还带 reasoning_content/refusal，不能整帧丢掉）
+            if _emit is not None and _emit != _piece:
+                _fixed = json.loads(json.dumps(obj))
+                _c = (_fixed.get("choices") or [{}])[0]
+                if isinstance(_c, dict) and isinstance(_c.get("delta"), dict):
+                    _c["delta"]["content"] = _emit
+                yield ("data: " + json.dumps(_fixed, ensure_ascii=False)
+                       + "\n\n").encode("utf-8")
+                continue
             yield line
     except (UpstreamStatus, GeneratorExit):
         # **控制流异常不得 flush**：
@@ -4388,9 +5228,13 @@ def iter_client_sse(resp, holder=None, custom_names=None):
         # 上游断连/超时（IncompleteRead、ConnectionReset 等）会把异常抛到这里。
         # 必须先补发缓冲中**完整**的调用再放行异常 —— 否则已完整到达的工具调用
         # 会被整批吞掉（比不做缓冲更差）。残缺的仍按 _flush 的判定丢弃。
+        # DSML 暂存同理不能闷掉：中断时只按普通文本补发（不再当可信调用）。
         try:
             for _ln in _flush():
                 yield _ln
+            if dsml_mode or dsml_pending:
+                for _f in _dsml_finalize(convert=False)[0]:
+                    yield _f
         except Exception:
             pass
         raise
@@ -4398,10 +5242,20 @@ def iter_client_sse(resp, holder=None, custom_names=None):
     if buf:
         for _ln in _flush():
             yield _ln
+    if dsml_mode or dsml_pending:
+        for _f in _dsml_finalize()[0]:
+            yield _f
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None):
-    """把上游信封流折叠成一个非流式 chat.completion 对象。"""
+def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None):
+    """把上游信封流折叠成一个非流式 chat.completion 对象。
+
+    allowed_names：本次请求声明的工具名集合（默认取 holder 里的
+    allowed_tool_names）；用于「泄漏文本回读」的守卫（见
+    parse_leaked_tool_calls）—— 名字不在集合内一律不还原（fail-open）。
+    """
+    if allowed_names is None:
+        allowed_names = (holder or {}).get("allowed_tool_names")
     content, reasoning, refusal, finish = [], [], [], "stop"
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
@@ -4489,10 +5343,38 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
     # 只看到一句空内容 + 未知 finish_reason，无法知道为何被拒。
     if refusal:
         message["refusal"] = "".join(refusal)
+    # 回读（issue #8/#11）：上游未给结构化 tool_calls，但正文恰好是网关内部
+    # 协议文本的形态（模型照格式复述）——还原为结构化调用，或按截断语义吞掉，
+    # 避免客户端把内部文本当正文显示、本轮调用不执行。判据与流式路径共用同一套
+    # （recover_leaked_tool_calls 的收尾分支）；客户端没声明工具时整块跳过
+    # （无白名单可校验，fail-open 保留文本）。
+    if allowed_names and not tool_calls_map and message.get("content"):
+        # issue #16-B1（非流式侧）：正文可能是「散文 + 回声块」。先按标记切分，
+        # 散文照常保留，只对标记起的那一段做回读/吞掉判定。
+        _head16, _block16 = _find_marker_split(message["content"],
+                                               allow_prefix=False)
+        _echo_src = _block16 or ""
+        if _echo_src:
+            _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
+            if _rec:
+                message["content"] = _head16 + (_clean or "")
+                tool_calls_map = {i: c for i, c in enumerate(_rec)}
+            elif _leaked_partial_droppable(_echo_src, allowed_names):
+                # issue #9：截断的 marker+JSON 回声不还原、也不透传。
+                log("dropped truncated leaked tool-call echo (%d chars) - "
+                    "issue #9" % len(_echo_src), level="WARN", tag="chat")
+                message["content"] = _head16
+            elif _tool_echo_droppable(_echo_src, allowed_names):
+                # issue #11：工具结果回声块同样不还原、不透传。
+                log("dropped leaked tool-result echo (%d chars) - issue #11"
+                    % len(_echo_src), level="WARN", tag="chat")
+                message["content"] = _head16
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
                           if (v.get("function") or {}).get("name")}
+    ordered = []
+    dropped_trunc = 0
     if tool_calls_map:
         ordered = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         # 截断防御：arguments 可能是半截 JSON（流被截断 / finish=length / 上游
@@ -4503,16 +5385,42 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
         _before = len(ordered)
         ordered = drop_truncated_tool_calls(
             ordered, custom_names=(holder or {}).get("custom_names"))
-        if len(ordered) < _before:
+        dropped_trunc = _before - len(ordered)
+        if dropped_trunc:
             log("dropped %d truncated tool_call(s) on model '%s' "
                 "(arguments not valid JSON, stream cut short)"
-                % (_before - len(ordered), model), level="WARN", tag="chat")
-    if tool_calls_map and ordered:
+                % (dropped_trunc, model), level="WARN", tag="chat")
+    if ordered:
         message["tool_calls"] = ordered
         if finish in ("stop", None):
             finish = "tool_calls"
-    elif finish == "tool_calls":
-        # 占位被全部过滤掉 -> 降级为正常结束，防止客户端无限挂起
+    # DSML 兜底（与 /v1/responses 对齐）：客户端声明了工具，模型却把
+    # DeepSeek 风格的 `<｜DSML｜calls>` 文本写进 content（Qoder 语境下常见）
+    # —— 不转换的话，客户端只看到一段「像调用却无法执行」的纯文本，且该文本
+    # 会进入下一轮上下文诱导模型继续模仿。仅在**本轮没有任何结构化
+    # tool_calls**、且解析出的 invoke 名全在客户端声明的工具集内时转换。
+    _allowed_names = (holder or {}).get("allowed_tool_names") or ()
+    if _allowed_names and not message.get("tool_calls") \
+            and "DSML" in (message.get("content") or ""):
+        _dsml_calls, _dsml_clean = parse_dsml_tool_calls(message["content"])
+        if _dsml_calls and all(
+                (c.get("name") or "") in _allowed_names for c in _dsml_calls):
+            message["tool_calls"] = [
+                {"id": c.get("id") or _new_id("call_"), "type": "function",
+                 "function": {"name": c.get("name") or "",
+                              "arguments": c.get("arguments") or "{}"}}
+                for c in _dsml_calls]
+            message["content"] = _dsml_clean or None
+            finish = "tool_calls"
+            log("DSML fallback: %d tool call(s) recovered from content on "
+                "model '%s'" % (len(_dsml_calls), model), tag="chat")
+    # finish 口径统一：截断优先（有调用被丢弃 -> 本轮不可信，置 length 让客户端
+    # 重试/续写，而不是把它当成「模型只调用了这一个工具」或「正常的空回复」）；
+    # 其次，没有任何可下发的调用却报 tool_calls -> 降级为 stop，防止客户端
+    # 无限挂起等待工具结果（占位被全部过滤掉 / 上游只给了 finish_reason）。
+    if dropped_trunc:
+        finish = "length"
+    elif not message.get("tool_calls") and finish == "tool_calls":
         finish = "stop"
     out = {
         "id": resp_id or "chatcmpl-qoder",
@@ -5140,20 +6048,12 @@ def stream_responses_events(inner_lines, model, holder):
                         if fn_name in custom_names:
                             entry["custom"] = True
                     if fn_args:
+                        # **不**即时下发 arguments 分片：SSE 写出即不可撤回，而
+                        # 是否截断只有收尾才能判定 —— 半截 JSON 一旦进入客户端的
+                        # 累积 buffer，客户端收尾时严格解析失败（实测报错
+                        # `Unterminated string`）。故此处只累积，收尾判定完整后
+                        # 再补发（见下方"已完成的结构化工具调用"段）。
                         entry["arguments"] += fn_args
-                        if entry.get("custom"):
-                            yield ev("response.custom_tool_call_input.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
-                        else:
-                            yield ev("response.function_call_arguments.delta", {
-                                "output_index": entry["output_index"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
@@ -5302,6 +6202,14 @@ def stream_responses_events(inner_lines, model, holder):
             finish = "length"
             continue
         if entry.get("custom"):
+            # 分片改为收尾补发（见聚合段的说明）：此处一次性下发完整 input。
+            if entry["arguments"]:
+                yield ev("response.custom_tool_call_input.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": entry["arguments"],
+                })
             yield ev("response.custom_tool_call_input.done", {
                 "output_index": entry["output_index"],
                 "item_id": entry["item_id"],
@@ -5317,6 +6225,13 @@ def stream_responses_events(inner_lines, model, holder):
                 "input": _unwrap_custom_input(entry["arguments"]),
             }
         else:
+            # 同上：分片在收尾一次性补发，绝不把半截 arguments 提前写出去。
+            if entry["arguments"]:
+                yield ev("response.function_call_arguments.delta", {
+                    "output_index": entry["output_index"],
+                    "call_id": entry["id"],
+                    "delta": entry["arguments"],
+                })
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
                 "call_id": entry["id"],
@@ -6429,7 +7344,11 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
-                  "model": model}
+                  "model": model,
+                  # 客户端声明的工具名（转换后的 chat 形态）：泄漏回读/DSML
+                  # 兜底的白名单 —— 名字不在名单内的文本一律不转换（fail-open）。
+                  "allowed_tool_names": declared_tool_names(
+                      chat_req.get("tools"))}
         # 本次请求的排队等待总预算：**初开与流内信封重开共用同一个截止时间**。
         req_queue_deadline = time.time() + _QUEUE_RETRY_BUDGET
         try:
@@ -6504,8 +7423,12 @@ class Handler(BaseHTTPRequestHandler):
                                     _c["n"] += 1
                                     yield item
 
-                            inner = _count_src(
-                                iter_inner_sse(cur, holder=holder))
+                            # 泄漏回读接在信封解包与事件翻译之间：还原出的调用
+                            # 走与结构化 tool_calls 完全相同的 added/delta/done
+                            # 事件，被吞掉的回声文本不会进 output_text。
+                            inner = _count_src(recover_leaked_tool_calls(
+                                iter_inner_sse(cur, holder=holder),
+                                allowed_names=holder.get("allowed_tool_names")))
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
@@ -6799,6 +7722,9 @@ class Handler(BaseHTTPRequestHandler):
         # custom freeform 工具名：流式截断防护需要据此跳过 JSON 判定 ——
         # 这类工具的载荷本就是自由文本，按「能否解析 JSON」判会误杀。
         _chat_custom = custom_tool_names(payload.get("tools"))
+        # 客户端声明的工具名（DSML 兜底白名单）：模型若把调用写成 DSML 文本，
+        # 只有 invoke 名全在该集合内才敢转成结构化 tool_calls。
+        _chat_tools = declared_tool_names(payload.get("tools"))
         # 保持原始终端 stream 意图
         want_stream = bool(payload.get("stream"))
         # 转换统一在 build_qoder_body 内做（压平/清洗/工具）
@@ -6857,7 +7783,10 @@ class Handler(BaseHTTPRequestHandler):
             holder = {"usage": None, "model": model,
                       # custom freeform 工具名：截断防护据此跳过 JSON 判定，
                       # 避免把自由文本载荷误杀（非流式聚合路径）。
-                      "custom_names": _chat_custom}
+                      "custom_names": _chat_custom,
+                      # 客户端声明的工具名：非流式聚合据此做 DSML 兜底白名单
+                      # 校验（与流式的 allowed_tool_names 同一份名单）。
+                      "allowed_tool_names": _chat_tools}
             if want_stream:
                 self.send_response(200)
                 self.send_header("Content-Type",
@@ -6881,10 +7810,23 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     while True:
                         try:
-                            # 经截断防护层：tool_calls 分片缓冲后按完整性补发，
-                            # 残缺参数不下发（否则客户端解析失败卡死会话）。
-                            for line in iter_client_sse(cur, holder=holder,
-                                                        custom_names=_chat_custom):
+                            # 守卫链（顺序与参数都不能改）：
+                            #   iter_client_sse(recover_leaked_tool_calls(
+                            #       iter_inner_sse(cur)))
+                            # 1) 截断防护层：tool_calls 分片缓冲后按完整性补发，
+                            #    残缺参数不下发（否则客户端解析失败卡死会话）；
+                            # 2) 泄漏回读：模型把内部协议文本（marker + JSON）
+                            #    复述成正文时还原为结构化 tool_calls / 按截断
+                            #    语义吞掉；必须在截断层**之前**，还原出的调用
+                            #    才能过同一套截断校验与白名单；
+                            # 3) DSML 文本兜底（白名单=客户端声明的工具名）。
+                            for line in iter_client_sse(
+                                    cur, holder=holder,
+                                    custom_names=_chat_custom,
+                                    allowed_tool_names=_chat_tools,
+                                    inner_lines=recover_leaked_tool_calls(
+                                        iter_inner_sse(cur, holder=holder),
+                                        allowed_names=_chat_tools)):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
                                 emitted = True

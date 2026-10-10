@@ -2306,6 +2306,626 @@ _joined32 = ''.join(_sent32b)
 check('truncation: streaming keeps custom payload (new coverage)',
       'apply_patch' in _joined32, _joined32[:160])
 
+# [33] 带工具的客户端不再继承模板的 Qoder 桌面端系统提示（非法工具 payload 源头）
+# 事故：客户端没带 system 时沿用 baseprompt.json 自带的 12KB Qoder CLI 提示
+# （教 Task/TodoWrite/Edit/Bash 的用法 + 桌面端语境：Working directory:
+# D:/Projects/Qoder 等）。模型照着它写 Qoder 形态的调用，与客户端实际声明的
+# 工具 schema 不符 —— 实测表现为非法工具 payload 与半截 arguments。
+_tmpl_sys33 = [m for m in (P.BASEPROMPT.get('messages') or [])
+               if (m or {}).get('role') == 'system'][0]['content']
+_tools33 = [{'type': 'function', 'function': {'name': 'edit', 'parameters': {}}}]
+_b33a = P.build_qoder_body(
+    {'model': 'qmodel', 'messages': [{'role': 'user', 'content': 'hi'}],
+     'tools': _tools33}, None, 'qmodel')
+check('[33] tools + no system: template Qoder CLI prompt NOT injected',
+      _b33a['messages'][0]['content'] == P.SYSTEM_PROMPT
+      and 'You are Qoder' not in _b33a['messages'][0]['content'],
+      _b33a['messages'][0]['content'][:60])
+check('[33] tools + no system: client tools still forwarded verbatim',
+      _b33a['tools'] == _tools33)
+_b33b = P.build_qoder_body(
+    {'model': 'qmodel', 'messages': [{'role': 'user', 'content': 'hi'}]},
+    None, 'qmodel')
+check('[33] no tools + no system: template prompt kept (unchanged)',
+      _b33b['messages'][0]['content'] == _tmpl_sys33)
+_b33c = P.build_qoder_body(
+    {'model': 'qmodel',
+     'messages': [{'role': 'system', 'content': 'S'},
+                  {'role': 'user', 'content': 'hi'}],
+     'tools': _tools33}, None, 'qmodel')
+check('[33] client system still wins when tools present',
+      _b33c['messages'][0]['content'] == 'S')
+
+# [34] 截断口径统一 + responses 流式不再泄漏半截 arguments
+# (a) chat 非流式：只要有调用被丢弃，finish 一律 length（此前部分丢弃保持
+#     tool_calls、全丢光降级为 stop -> 客户端看到「成功的空响应」）。
+# (b) responses 流式：arguments 分片此前**即时下发**，收尾才判定截断 ——
+#     残破 JSON 早已进了客户端的累积 buffer（omp 报 Unterminated string）。
+#     现改为收尾统一补发：被判定截断的整条不发。
+_OK34 = {'id': 'c1', 'type': 'function',
+         'function': {'name': 'edit', 'arguments': '{"a":1}'}}
+_TR34 = {'id': 'c2', 'type': 'function',
+         'function': {'name': 'edit', 'arguments': '{"b":'}}
+_ESC34 = json.dumps('{"b":')[1:-1]          # {\"b\":  —— 序列化后的形态
+
+
+def _agg34(calls, finish='tool_calls'):
+    lines = [_env32({'choices': [{'delta': {'tool_calls': calls}}]}),
+             _env32({'choices': [{'delta': {}, 'finish_reason': finish}]})]
+    return P.aggregate_stream(_Resp32(lines), 'm', None,
+                              holder={'usage': None, 'model': 'm'})
+
+
+_a34 = _agg34([_OK34, _TR34])
+_c34 = _a34['choices'][0]
+check('[34] chat non-stream: partial drop keeps call but finish=length',
+      [t['id'] for t in (_c34['message'].get('tool_calls') or [])] == ['c1']
+      and _c34['finish_reason'] == 'length', _c34['finish_reason'])
+_a34b = _agg34([_TR34])
+_c34b = _a34b['choices'][0]
+check('[34] chat non-stream: all dropped -> length (not stop), no tool_calls',
+      not _c34b['message'].get('tool_calls')
+      and _c34b['finish_reason'] == 'length', _c34b['finish_reason'])
+# 旧守卫必须保留：上游只给 finish_reason=tool_calls 却没有任何调用（占位被全部
+# 过滤）-> 降级 stop，否则客户端一直等工具结果而空转
+_a34c = _agg34([])
+check('[34] chat non-stream: no calls + finish=tool_calls -> stop (hang guard)',
+      not _a34c['choices'][0]['message'].get('tool_calls')
+      and _a34c['choices'][0]['finish_reason'] == 'stop',
+      _a34c['choices'][0]['finish_reason'])
+check('[34] chat non-stream: truncated args never in the payload',
+      _ESC34 not in json.dumps(_a34b), json.dumps(_a34b)[:120])
+# responses 非流式（同一聚合体）：status 必须 incomplete，且无残破 JSON
+_r34 = P.chat_to_response(_a34b, 'm')
+check('[34] responses non-stream: truncated round incomplete, no broken args',
+      _r34['status'] == 'incomplete' and _ESC34 not in json.dumps(_r34),
+      {'status': _r34['status'],
+       'types': [o.get('type') for o in _r34['output']]})
+
+
+def _rchunk34(delta, finish=None):
+    return ('data: ' + json.dumps({'choices': [{'delta': delta,
+                                                'finish_reason': finish}]})
+            + chr(10) + chr(10)).encode('utf-8')
+
+
+def _resp_stream34(chunks):
+    return b''.join(P.stream_responses_events(
+        iter(chunks), 'm',
+        {'usage': None, 'custom_names': set()})).decode('utf-8')
+
+
+_txt34 = _resp_stream34([
+    _rchunk34({'tool_calls': [{'index': 0, 'id': 'call_1',
+                               'function': {'name': 'edit', 'arguments': ''}}]}),
+    _rchunk34({'tool_calls': [{'index': 0,
+                               'function': {'arguments': '{"path": "/a'}}]}),
+    _rchunk34({}, 'length')])
+check('[34] responses stream: truncated fragment NEVER reaches the client',
+      _ESC34 not in _txt34
+      and 'response.function_call_arguments.delta' not in _txt34
+      and 'response.function_call_arguments.done' not in _txt34,
+      [l for l in _txt34.splitlines() if 'arguments' in l][:1])
+check('[34] responses stream: truncated round ends incomplete',
+      '"status": "incomplete"' in _txt34)
+_ev34 = [json.loads(l[6:]) for l in _txt34.splitlines() if l.startswith('data: ')]
+_tr34 = [e['item'] for e in _ev34
+         if e.get('type') == 'response.output_item.done']
+check('[34] responses stream: truncated done item has no arguments field',
+      bool(_tr34) and 'arguments' not in _tr34[0]
+      and _tr34[0].get('status') == 'incomplete', _tr34[:1])
+_txt34b = _resp_stream34([
+    _rchunk34({'tool_calls': [{'index': 0, 'id': 'call_1',
+                               'function': {'name': 'edit', 'arguments': ''}}]}),
+    _rchunk34({'tool_calls': [{'index': 0,
+                               'function': {'arguments': '{"path": "/a.ts"}'}}]}),
+    _rchunk34({}, 'tool_calls')])
+_ev34b = [json.loads(l[6:]) for l in _txt34b.splitlines()
+          if l.startswith('data: ')]
+check('[34] responses stream: complete call still delivered (delta + done)',
+      [e.get('delta') for e in _ev34b
+       if e.get('type') == 'response.function_call_arguments.delta']
+      == ['{"path": "/a.ts"}']
+      and [e.get('arguments') for e in _ev34b
+           if e.get('type') == 'response.function_call_arguments.done']
+      == ['{"path": "/a.ts"}'],
+      [e.get('type') for e in _ev34b])
+
+# [35] /v1/chat/completions 的 DSML 兜底（与 /v1/responses 对齐）
+# 模型偶尔把调用写成 DeepSeek 风格的 `<｜DSML｜calls>` 文本而不是结构化
+# tool_calls（Qoder 语境下更常见）。此前只有 responses 路径解析，chat 路径
+# 原样把标签文本交给客户端 —— 调用不执行，且该文本进入下一轮上下文诱导模仿。
+_DS35 = chr(0xFF5C)          # 全角竖线 ｜（官方标签形态）
+_BLK35 = ('<' + _DS35 + 'DSML' + _DS35 + 'calls>' + chr(10)
+          + '<' + _DS35 + 'DSML' + _DS35 + 'invoke name="edit">' + chr(10)
+          + '<' + _DS35 + 'DSML' + _DS35 + 'parameter name="path">/a.ts</'
+          + _DS35 + 'DSML' + _DS35 + 'parameter>' + chr(10)
+          + '</' + _DS35 + 'DSML' + _DS35 + 'invoke>' + chr(10)
+          + '</' + _DS35 + 'DSML' + _DS35 + 'calls>')
+
+# 增量匹配器（流式起始探测）：普通文本里的 "<" 不得被扣留
+check('[35] DSML matcher: prefix states',
+      P._dsml_open_state('<') == 'maybe'
+      and P._dsml_open_state('<' + _DS35 + 'DSML' + _DS35 + 'ca') == 'maybe'
+      and P._dsml_open_state('<' + _DS35 + 'DSML' + _DS35 + 'calls') == 'maybe'
+      and P._dsml_open_state('<' + _DS35 + 'DSML' + _DS35 + 'calls>') == 'match'
+      and P._dsml_open_state('<|DSML|calls>') == 'match'
+      and P._dsml_open_state('<div>') == 'no'
+      and P._dsml_open_state('< b') == 'no')
+check('[35] declared_tool_names covers chat + top-level shapes',
+      P.declared_tool_names([{'type': 'function',
+                              'function': {'name': 'edit'}},
+                             {'type': 'custom', 'name': 'apply_patch'}])
+      == {'edit', 'apply_patch'})
+
+
+def _agg35(content, finish='stop', names=None):
+    holder = {'usage': None, 'model': 'm'}
+    if names is not None:
+        holder['allowed_tool_names'] = names
+    lines = [_env32({'choices': [{'delta': {'content': content}}]}),
+             _env32({'choices': [{'delta': {}, 'finish_reason': finish}]})]
+    return P.aggregate_stream(_Resp32(lines), 'm', None, holder=holder)
+
+
+_a35 = _agg35('先看文件 ' + _BLK35 + ' 完成', names={'edit'})
+_m35 = _a35['choices'][0]['message']
+_tcs35 = _m35.get('tool_calls') or []
+check('[35] DSML non-stream: converted to OpenAI tool_calls',
+      [_tc['function']['name'] for _tc in _tcs35] == ['edit']
+      and json.loads(_tcs35[0]['function']['arguments']) == {'path': '/a.ts'}
+      and _tcs35[0]['type'] == 'function' and bool(_tcs35[0].get('id')),
+      _tcs35)
+check('[35] DSML non-stream: content cleaned + finish=tool_calls',
+      _a35['choices'][0]['finish_reason'] == 'tool_calls'
+      and _m35.get('content') == '先看文件 完成', _m35.get('content'))
+_m35b = _agg35(_BLK35, names={'read_file'})['choices'][0]['message']
+check('[35] DSML non-stream: non-declared name -> text kept, no tool_calls',
+      not _m35b.get('tool_calls') and 'DSML' in (_m35b.get('content') or ''))
+_m35c = _agg35(_BLK35)['choices'][0]['message']
+check('[35] DSML non-stream: no declared tools -> no fallback (compat)',
+      not _m35c.get('tool_calls') and 'DSML' in (_m35c.get('content') or ''))
+
+
+def _frames35(lines, names=None):
+    return ''.join(ln.decode('utf-8', 'replace') for ln in
+                   P.iter_client_sse(_Resp32(lines), allowed_tool_names=names))
+
+
+_split35 = ['看这里 ', '<' + _DS35, 'DSML' + _DS35 + 'ca',
+            'lls>' + chr(10) + '<' + _DS35 + 'DSML' + _DS35
+            + 'invoke name="edit">',
+            '<' + _DS35 + 'DSML' + _DS35 + 'parameter name="path">/a.ts</'
+            + _DS35 + 'DSML' + _DS35 + 'parameter>',
+            '</' + _DS35 + 'DSML' + _DS35 + 'invoke></' + _DS35 + 'DSML'
+            + _DS35 + 'calls>']
+_lines35 = [_env32({'choices': [{'delta': {'content': p}}]})
+            for p in _split35]
+_lines35.append(_env32({'choices': [{'delta': {},
+                                     'finish_reason': 'stop'}]}))
+_out35 = _frames35(_lines35, {'edit'})
+_ev35 = [json.loads(l[6:]) for l in _out35.splitlines()
+         if l.startswith('data: ')]
+# 透传帧是上游原始字节（CJK 以 \uXXXX 转义），故按解析后的 content 断言
+_c35a = ''.join(e['choices'][0]['delta'].get('content') or '' for e in _ev35)
+check('[35] DSML stream: raw tags never reach the client',
+      'DSML' not in _out35 and '看这里' in _c35a, _out35[:120])
+_tc35 = [e['choices'][0]['delta']['tool_calls'][0] for e in _ev35
+         if e['choices'][0]['delta'].get('tool_calls')]
+check('[35] DSML stream: tool_calls frames in OpenAI shape (id+name, args)',
+      len(_tc35) == 2 and bool(_tc35[0].get('id'))
+      and _tc35[0]['function']['name'] == 'edit'
+      and json.loads(_tc35[1]['function']['arguments']) == {'path': '/a.ts'},
+      _tc35)
+_fr35 = [e['choices'][0].get('finish_reason') for e in _ev35]
+check('[35] DSML stream: finish frame rewritten to tool_calls',
+      _fr35[-1] == 'tool_calls', _fr35)
+_out35b = _frames35(_lines35, {'read_file'})
+check('[35] DSML stream: non-declared name -> text passes through',
+      'tool_calls' not in _out35b and 'DSML' in _out35b)
+# 普通 "<" 立即透传（不被扣留/篡改）
+_out35c = _frames35(
+    [_env32({'choices': [{'delta': {'content': 'a <div> b'}}]}),
+     _env32({'choices': [{'delta': {'content': ' 1<2 c'}}]}),
+     _env32({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})],
+    {'edit'})
+_c35 = ''.join(e['choices'][0]['delta'].get('content') or '' for e in
+               [json.loads(l[6:]) for l in _out35c.splitlines()
+                if l.startswith('data: ')])
+check('[35] DSML stream: ordinary "<" content passes through unchanged',
+      _c35 == 'a <div> b 1<2 c', _c35)
+# 断流：暂存文本必须补发（不能闷掉），异常仍要放行
+_sent35 = []
+_err35 = None
+try:
+    for _ln35 in P.iter_client_sse(
+            _Resp32([_env32({'choices': [{'delta': {
+                'content': '<' + _DS35 + 'DSML' + _DS35 + 'calls>'
+                           + chr(10) + 'x'}}]})],
+                    exc=ConnectionResetError('x')),
+            allowed_tool_names={'edit'}):
+        _sent35.append(_ln35.decode('utf-8', 'replace'))
+except BaseException as _e35:
+    _err35 = type(_e35).__name__
+check('[35] DSML stream: interrupted stream flushes buffer (not swallowed)',
+      _err35 == 'ConnectionResetError' and 'DSML' in ''.join(_sent35),
+      {'exc': _err35, 'sent': ''.join(_sent35)[:80]})
+
+# [36] 泄漏回读守卫（上游 issue #8/#9/#11/#16）
+# 模型把网关内部协议文本复述成正文时的五种形态 + 误伤方向，四条出口
+# （chat 流式/非流式、responses 流式/非流式）都要过同一套判据：
+#   A  marker 开头 + 截断；B1 散文与 marker 同帧；B2 散文与 marker 分帧；
+#   B3 截断落在未写完的 \uXXXX 转义里；C [工具结果] 回声块。
+print()
+print('[36] leaked tool-call readback (issues #8/#9/#11/#16)')
+
+_M36 = P.LEAK_MARKER
+_NAMES36 = {'terminal', 'write_file'}
+_CALLS36 = json.dumps([{'name': 'terminal',
+                        'arguments': json.dumps({'cmd': 'ls'})}],
+                      ensure_ascii=False)
+_LEAK36 = _M36 + chr(10) + _CALLS36
+_TRUNC36 = _M36 + chr(10) + _CALLS36[:40]      # 未闭合字符串（issue #9 样本）
+_ESC36 = (_M36 + chr(10)
+          + '[{"name": "write_file", "arguments": "{\\"content\\": \\"probe \\u63a2')
+_PROSE36 = 'edge 端点有响应（400/406 = 服务器活着）。调整参数重试。' + chr(10)
+_ECHO36 = ('[工具结果]' + chr(10) + '{"output": "ok"}' + chr(10)
+           + '[工具结果结束]' + chr(10))
+
+check('[36] hold window = longest marker - 1',
+      P._MARKER_HOLD_WINDOW == len(P.LEAK_MARKER) - 1 == 17,
+      P._MARKER_HOLD_WINDOW)
+check('[36] declared names cover chat + top-level tool shapes',
+      P.declared_tool_names([{'type': 'function', 'function': {'name': 'a'}},
+                             {'type': 'function', 'name': 'b'}]) == {'a', 'b'})
+
+_rec36, _clean36 = P.parse_leaked_tool_calls(_LEAK36, _NAMES36)
+check('[36] strict form: marker + JSON array -> structured call, text cleared',
+      bool(_rec36) and _clean36 == ''
+      and _rec36[0]['function']['name'] == 'terminal'
+      and json.loads(_rec36[0]['function']['arguments'])['cmd'] == 'ls',
+      (_rec36, _clean36))
+check('[36] fenced form (```json) also recovered',
+      bool(P.parse_leaked_tool_calls('```json' + chr(10) + _LEAK36
+                                     + chr(10) + '```', _NAMES36)[0]))
+check('[36] undeclared tool name -> no recovery (whitelist kept)',
+      P.parse_leaked_tool_calls(_LEAK36, {'other'})[0] is None)
+check('[36] prose discussing the marker -> no recovery',
+      P.parse_leaked_tool_calls('网关会写入 ' + _M36 + ' 这样的提示。')[0] is None)
+check('[36] trailing text after the array -> no recovery',
+      P.parse_leaked_tool_calls(_LEAK36 + chr(10) + '以上。', _NAMES36)[0] is None)
+
+
+def _chunk36(content=None, fin=None):
+    delta = {} if content is None else {'content': content}
+    return {'id': 'c36', 'model': 'm', 'created': 1,
+            'choices': [{'index': 0, 'delta': delta, 'finish_reason': fin}]}
+
+
+def _envlines36(chunks, exc=None):
+    return _Resp32([_env32(c) for c in chunks], exc=exc)
+
+
+def _chat_stream36(chunks, names=_NAMES36, exc=None):
+    """走完整 chat 流式守卫链（回读 -> 截断/DSML 转发），按客户端视角取值。"""
+    src = P.recover_leaked_tool_calls(
+        P.iter_inner_sse(_envlines36(chunks, exc=exc)), allowed_names=names)
+    text, calls, finish = '', 0, None
+    for ln in P.iter_client_sse(None, holder={'model': 'm'},
+                                allowed_tool_names=names, inner_lines=src):
+        s = ln.decode('utf-8', 'replace')
+        if not s.startswith('data: '):
+            continue
+        d = json.loads(s[6:].strip())
+        ch = (d.get('choices') or [{}])[0]
+        dl = ch.get('delta') or {}
+        if isinstance(dl.get('content'), str):
+            text += dl['content']
+        for _tc in dl.get('tool_calls') or []:
+            calls += 1
+        if ch.get('finish_reason'):
+            finish = ch['finish_reason']
+    return text, calls, finish
+
+
+def _agg36(chunks, names=_NAMES36):
+    holder = {'usage': None, 'model': 'm', 'allowed_tool_names': names}
+    return P.aggregate_stream(_envlines36(chunks), 'm', None, holder=holder)
+
+
+def _resp_stream36(chunks, names=_NAMES36):
+    lines = [('data: ' + json.dumps(c) + chr(10) + chr(10)).encode('utf-8')
+             for c in chunks]
+    holder = {'usage': None, 'custom_names': set(), 'allowed_tool_names': names}
+    return b''.join(P.stream_responses_events(
+        P.recover_leaked_tool_calls(iter(lines), allowed_names=names),
+        'm', holder)).decode('utf-8')
+
+
+def _resp_events36(text):
+    return [json.loads(l[6:]) for l in text.splitlines() if l.startswith('data: ')]
+
+
+def _resp_text36(text):
+    return ''.join(e.get('delta') or '' for e in _resp_events36(text)
+                   if e.get('type') == 'response.output_text.delta')
+
+
+# --- A：完整 marker + JSON（跨帧分段）→ 还原为结构化调用 ---
+_t36, _c36, _f36 = _chat_stream36([_chunk36(_LEAK36[:12]),
+                                   _chunk36(_LEAK36[12:]),
+                                   _chunk36(None, 'stop')])
+check('[36] chat stream A: leak -> tool_calls deltas, no text, finish=tool_calls',
+      _t36 == '' and _c36 >= 1 and _f36 == 'tool_calls', (_t36, _c36, _f36))
+_a36 = _agg36([_chunk36(_LEAK36[:12]), _chunk36(_LEAK36[12:]),
+               _chunk36(None, 'stop')])
+_c36a = _a36['choices'][0]
+check('[36] chat non-stream A: leak -> structured call, finish=tool_calls',
+      _c36a['finish_reason'] == 'tool_calls'
+      and _c36a['message'].get('content') == ''
+      and ((_c36a['message'].get('tool_calls') or [{}])[0].get('function')
+           or {}).get('name') == 'terminal', _c36a)
+_txt36r = _resp_stream36([_chunk36(_LEAK36[:12]), _chunk36(_LEAK36[12:]),
+                          _chunk36(None, 'stop')])
+_fc36 = [e['item'] for e in _resp_events36(_txt36r)
+         if e.get('type') == 'response.output_item.done'
+         and (e.get('item') or {}).get('type') == 'function_call']
+check('[36] responses stream A: leak -> function_call item, no text leak',
+      _resp_text36(_txt36r) == '' and bool(_fc36)
+      and _fc36[0].get('name') == 'terminal'
+      and _M36 not in _txt36r, (_resp_text36(_txt36r)[:60], _fc36[:1]))
+_r36 = P.chat_to_response(_agg36([_chunk36(_LEAK36), _chunk36(None, 'stop')]),
+                          'm')
+check('[36] responses non-stream A: leak -> function_call, no text leak',
+      any(o.get('type') == 'function_call' for o in _r36['output'])
+      and _M36 not in json.dumps(_r36, ensure_ascii=False),
+      [o.get('type') for o in _r36['output']])
+
+# --- B1：散文与 marker 落在同一帧 -> 散文逐字保留 + 调用还原 ---
+_t36b, _c36b, _f36b = _chat_stream36([_chunk36(_PROSE36 + _LEAK36),
+                                      _chunk36(None, 'stop')])
+check('[36] chat stream B1: prose kept verbatim, marker recovered',
+      _t36b == _PROSE36 and _c36b >= 1 and _M36 not in _t36b,
+      (_t36b[:60], _c36b))
+_a36b = _agg36([_chunk36(_PROSE36 + _LEAK36), _chunk36(None, 'stop')])
+_c36b2 = _a36b['choices'][0]
+check('[36] chat non-stream B1: prose kept, call recovered',
+      _c36b2['message'].get('content') == _PROSE36
+      and _c36b2['finish_reason'] == 'tool_calls', _c36b2)
+
+# --- B2：散文与 marker 分帧 ---
+_t36c, _c36c, _f36c = _chat_stream36([_chunk36(_PROSE36), _chunk36(_M36),
+                                      _chunk36(chr(10)), _chunk36(_CALLS36),
+                                      _chunk36(None, 'stop')])
+check('[36] chat stream B2: prose/marker in separate deltas',
+      _t36c == _PROSE36 and _c36c >= 1 and _M36 not in _t36c,
+      (_t36c[:60], _c36c))
+
+# --- B3：截断落在未写完的 \uXXXX 转义里（issue #16-B3）---
+_t36d, _c36d, _f36d = _chat_stream36([_chunk36(_ESC36), _chunk36(None, 'stop')])
+check('[36] chat stream B3: truncated \\uXXXX escape swallowed',
+      _t36d == '' and _c36d == 0 and _M36 not in _t36d, (_t36d[:60], _c36d))
+_a36d = _agg36([_chunk36(_ESC36), _chunk36(None, 'stop')])
+check('[36] chat non-stream B3: truncated escape swallowed',
+      _a36d['choices'][0]['message'].get('content') == ''
+      and not _a36d['choices'][0]['message'].get('tool_calls')
+      and _a36d['choices'][0]['finish_reason'] == 'stop', _a36d['choices'][0])
+
+# --- A(截断)：marker + 未写完的数组 -> 吞掉，绝不透传 ---
+_t36e, _c36e, _f36e = _chat_stream36([_chunk36(_TRUNC36[:12]),
+                                      _chunk36(_TRUNC36[12:]),
+                                      _chunk36(None, 'stop')])
+check('[36] chat stream: truncated echo swallowed (finish stays stop)',
+      _t36e == '' and _c36e == 0 and _f36e == 'stop'
+      and _M36 not in _t36e, (_t36e[:60], _f36e))
+_a36e = _agg36([_chunk36(_TRUNC36), _chunk36(None, 'stop')])
+check('[36] chat non-stream: truncated echo swallowed',
+      _a36e['choices'][0]['message'].get('content') == ''
+      and _a36e['choices'][0]['finish_reason'] == 'stop', _a36e['choices'][0])
+_txt36t = _resp_stream36([_chunk36(_TRUNC36[:12]), _chunk36(_TRUNC36[12:]),
+                          _chunk36(None, 'stop')])
+check('[36] responses stream: truncated echo not in output_text',
+      _resp_text36(_txt36t) == '' and _M36 not in _txt36t,
+      _resp_text36(_txt36t)[:60])
+
+# --- C：[工具结果] 回声块（issue #11）---
+_t36f, _c36f, _f36f = _chat_stream36([_chunk36(_ECHO36), _chunk36(None, 'stop')])
+check('[36] chat stream C: tool-result echo swallowed',
+      '[工具结果' not in _t36f and _t36f == '', (_t36f[:60], _c36f))
+_a36f = _agg36([_chunk36(_ECHO36), _chunk36(None, 'stop')])
+check('[36] chat non-stream C: tool-result echo swallowed',
+      '[工具结果' not in (_a36f['choices'][0]['message'].get('content') or ''),
+      _a36f['choices'][0]['message'].get('content'))
+_txt36c = _resp_stream36([_chunk36(_ECHO36), _chunk36(None, 'stop')])
+check('[36] responses stream C: tool-result echo swallowed',
+      '[工具结果' not in _txt36c, _txt36c[:80])
+
+# --- 误伤方向：正常文本逐字不变（含重复输出）---
+_t36g, _c36g, _f36g = _chat_stream36([_chunk36('看这个数组：' + chr(10) + '['),
+                                      _chunk36('1,2,3]'),
+                                      _chunk36(None, 'stop')])
+check('[36] false positive: array-like prose passes through unchanged',
+      _t36g == '看这个数组：' + chr(10) + '[1,2,3]' and _c36g == 0,
+      (_t36g, _c36g))
+_t36h, _c36h, _f36h = _chat_stream36(
+    [_chunk36('我们在讨论 ' + _M36 + ' 这个标记本身，不要吞。'),
+     _chunk36(None, 'stop')])
+check('[36] false positive: prose mentioning the marker untouched',
+      _t36h == '我们在讨论 ' + _M36 + ' 这个标记本身，不要吞。', _t36h[:80])
+_t36i, _c36i, _f36i = _chat_stream36([_chunk36(_LEAK36), _chunk36(None, 'stop')],
+                                     names={'other_tool'})
+check('[36] false positive: undeclared names -> text passes through (fail-open)',
+      _t36i == _LEAK36 and _c36i == 0, (_t36i[:60], _c36i))
+_t36j, _c36j, _f36j = _chat_stream36([_chunk36(_LEAK36), _chunk36(None, 'stop')],
+                                     names=None)
+check('[36] no declared tools -> guard inert, text passes through',
+      _t36j == _LEAK36 and _c36j == 0, (_t36j[:60], _c36j))
+_a36j = _agg36([_chunk36(_LEAK36), _chunk36(None, 'stop')], names=None)
+check('[36] non-stream, no declared tools -> text passes through',
+      _a36j['choices'][0]['message'].get('content') == _LEAK36,
+      _a36j['choices'][0]['message'].get('content'))
+_a36i = _agg36([_chunk36('```json' + chr(10) + '{"a": 1}' + chr(10) + '```'),
+                _chunk36(None, 'stop')])
+check('[36] false positive: ordinary fenced code block untouched',
+      '```json' in (_a36i['choices'][0]['message'].get('content') or ''),
+      _a36i['choices'][0]['message'].get('content'))
+
+# --- 未改动的帧必须原样透传（同一帧可能还带 reasoning/refusal 等字段）---
+_mixed36 = {'id': 'c', 'model': 'm', 'created': 1, 'choices': [
+    {'index': 0, 'delta': {'content': 'Hello', 'reasoning_content': 'think'},
+     'finish_reason': None}]}
+_r36, _reason36 = '', []
+for _ln36 in P.recover_leaked_tool_calls(
+        P.iter_inner_sse(_envlines36([_mixed36, _chunk36(None, 'stop')])),
+        _NAMES36):
+    _d36 = json.loads(_ln36.decode('utf-8')[6:])
+    _dl36 = (_d36.get('choices') or [{}])[0].get('delta') or {}
+    _r36 += _dl36.get('content') or ''
+    _reason36.append(_dl36.get('reasoning_content'))
+check('[36] pass-through keeps sibling delta fields (reasoning not dropped)',
+      _r36 == 'Hello' and 'think' in _reason36, (_r36, _reason36))
+_plain36 = _chunk36('plain')
+_out36 = list(P.recover_leaked_tool_calls(
+    P.iter_inner_sse(_envlines36([_plain36, _chunk36(None, 'stop')])),
+    _NAMES36))
+check('[36] untouched content frame passes through byte-identical',
+      len(_out36) == 2
+      and _out36[0] == ('data: ' + json.dumps(_plain36)
+                        + chr(10) + chr(10)).encode('utf-8'), _out36[:1])
+
+# --- 中断/控制流语义：UpstreamStatus 不得被吞、断连不闷掉非候选文本 ---
+_sent36 = []
+_raised36 = None
+try:
+    for _ln36 in P.recover_leaked_tool_calls(
+            P.iter_inner_sse(_envlines36(
+                [_chunk36(_LEAK36)],
+                exc=P.UpstreamStatus(403, '{"code":"10605"}'))),
+            _NAMES36):
+        _sent36.append(_ln36)
+except P.UpstreamStatus:
+    _raised36 = 'UpstreamStatus'
+check('[36] guard: UpstreamStatus passes through, held leak NOT flushed',
+      _raised36 == 'UpstreamStatus' and _sent36 == [],
+      {'raised': _raised36, 'sent': len(_sent36)})
+_sent36b = []
+_raised36b = None
+try:
+    for _ln36 in P.recover_leaked_tool_calls(
+            P.iter_inner_sse(_envlines36([_chunk36('```')],
+                                         exc=ConnectionResetError('x'))),
+            _NAMES36):
+        _sent36b.append(_ln36)
+except ConnectionResetError:
+    _raised36b = 'ConnectionResetError'
+check('[36] guard: interrupt flushes non-leak hold (text not lost)',
+      _raised36b == 'ConnectionResetError'
+      and '```' in ''.join(_l.decode('utf-8', 'replace') for _l in _sent36b),
+      {'exc': _raised36b, 'sent': ''.join(
+          _l.decode('utf-8', 'replace') for _l in _sent36b)[:60]})
+
+# [37] 上游 SSE 断帧重组（社区实测：一帧被从 JSON 中间切断/注入裸换行）
+# 逐行读取时半截 JSON 解析失败 -> 整帧静默丢弃；丢的若是带 id/name 的工具头帧，
+# 客户端只剩参数增量（报 "tool call delta is missing id or name"）。
+print()
+print('[37] upstream SSE frame reassembly (split frames)')
+
+_IN37 = {'id': 'cc37', 'model': 'm',
+         'choices': [{'delta': {'content': 'hi'}, 'finish_reason': None}]}
+_ENV37 = _env32(_IN37)                    # 一帧完整信封（含尾部空行）
+_RAW37 = _ENV37.rstrip(b'\n')             # 事件本体
+
+
+def _split37(raw, at, tail=True):
+    """把事件本体在字节位置 at 处切断（模拟注入的裸换行）。"""
+    out = [raw[:at] + b'\n', raw[at:] + b'\n\n']
+    return out
+
+
+_cut37 = _RAW37.find(b'"body"') + 8
+_lines37 = _split37(_RAW37, _cut37)
+check('[37] premise: the split line alone does not parse',
+      not P._sse_payload_ok(_lines37[0].decode().rstrip('\n')))
+_out37 = list(P.iter_inner_sse(_Resp32(_lines37)))
+check('[37] split frame reassembled into one chunk (not dropped)',
+      len(_out37) == 1 and b'"content"' in _out37[0] and b'hi' in _out37[0],
+      _out37)
+check('[37] reassembled output identical to the intact stream',
+      _out37 == list(P.iter_inner_sse(_Resp32([_ENV37]))), _out37)
+
+# 切在 data: 前缀内部（zenodinh/pi-provider-qoder#12 的真实抓包形态）
+_out37b = list(P.iter_inner_sse(_Resp32([b'data\n', _RAW37[5:] + b'\n\n'])))
+check('[37] split inside the data: prefix also reassembled',
+      len(_out37b) == 1 and b'hi' in _out37b[0], _out37b)
+
+# 完整帧逐行即时放行；心跳/注释与 event: 元数据不干扰
+_out37c = list(P.iter_inner_sse(_Resp32([
+    b': ping\n', _ENV37, b'event:finish{"totalTime":10}\n',
+    b'data:{"body":"[DONE]"}\n\n'])))
+check('[37] intact frames still pass through (heartbeat/event noise ignored)',
+      len(_out37c) == 1 and b'hi' in _out37c[0], _out37c)
+
+# 未闭合的帧：流末仍未决 -> 丢弃，绝不把半截 JSON 透传
+_out37d = list(P.iter_inner_sse(_Resp32([_RAW37[:20] + b'\n'])))
+check('[37] unclosed frame dropped at end of stream (no half JSON out)',
+      _out37d == [], _out37d)
+
+# 死块不得连坐后续完整帧（恢复能力）
+_out37e = list(P.iter_inner_sse(_Resp32([
+    _RAW37[:20] + b'\n', _ENV37, b'data:{"body":"[DONE]"}\n\n'])))
+check('[37] dead fragment does not swallow the next intact frame',
+      len(_out37e) == 1 and b'hi' in _out37e[0], _out37e)
+
+# 工具头帧被切断：id/name 必须完整送达（社区报告的实际故障形态）
+_IN37f = {'choices': [{'delta': {'tool_calls': [
+    {'index': 0, 'id': 'call_1', 'type': 'function',
+     'function': {'name': 'edit', 'arguments': '{"p":1}'}}]},
+    'finish_reason': None}]}
+_ENV37f = _env32(_IN37f)
+_cutf = _ENV37f.find(b'call_1') + 2
+_out37f = list(P.iter_inner_sse(_Resp32(
+    [_ENV37f[:_cutf] + b'\n', _ENV37f[_cutf:]])))
+check('[37] split tool-call header frame keeps id + name',
+      len(_out37f) == 1 and b'call_1' in _out37f[0] and b'edit' in _out37f[0],
+      _out37f)
+
+# 错误信封被切断：重组层不得吞掉 UpstreamStatus（排队/额度换号的控制流信号）
+_ERR37 = ('data: ' + json.dumps({'statusCodeValue': 503, 'body': 'quota'})
+          + chr(10) + chr(10)).encode('utf-8').rstrip(b'\n')
+_cutq = _ERR37.find(b'quota') + 2
+_raised37 = None
+try:
+    list(P.iter_inner_sse(_Resp32([_ERR37[:_cutq] + b'\n',
+                                   _ERR37[_cutq:] + b'\n\n'])))
+except P.UpstreamStatus as exc:
+    _raised37 = str(exc.status)
+check('[37] split error envelope still raises UpstreamStatus',
+      _raised37 == '503', _raised37)
+
+# 断帧 + 泄漏文本同时出现（真实会话形态）：客户端既不看到半截 JSON，也不看到 marker
+_LEAK37 = {'id': 'c37', 'model': 'm', 'choices': [
+    {'delta': {'content': _M36 + chr(10) + _CALLS36}, 'finish_reason': None}]}
+_ENV37L = _env32(_LEAK37)
+_cutl = _ENV37L.find(b'assistant') + 3
+_src37 = P.recover_leaked_tool_calls(
+    P.iter_inner_sse(_Resp32([_ENV37L[:_cutl] + b'\n', _ENV37L[_cutl:]])),
+    allowed_names=_NAMES36)
+_text37, _calls37 = '', 0
+for _ln37 in P.iter_client_sse(None, holder={'model': 'm'},
+                               allowed_tool_names=_NAMES36, inner_lines=_src37):
+    _s37 = _ln37.decode('utf-8', 'replace')
+    if not _s37.startswith('data: '):
+        continue
+    _d37 = json.loads(_s37[6:].strip())
+    _dl37 = (_d37.get('choices') or [{}])[0].get('delta') or {}
+    if isinstance(_dl37.get('content'), str):
+        _text37 += _dl37['content']
+    for _t37 in _dl37.get('tool_calls') or []:
+        _calls37 += 1
+check('[37] split frame + leak together: call recovered, no marker leak',
+      _text37 == '' and _calls37 >= 1 and _M36 not in _text37,
+      (_text37[:60], _calls37))
+
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

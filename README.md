@@ -20,7 +20,7 @@
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（官方能力门控）**：签到/Pro 福利活动**仅国内版提供**（国际版官方无签到接口）；国内版每日签到（活动 `DISABLED` 时诚实跳过不硬领）、连续签到统计、Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日 22:00 Token 集中保活（签到已移交 `qoder2api` 计划任务，见 §4），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
-- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译与 DSML 工具调用回退解析。
+- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析与内部协议文本的泄漏回读；上游被切断的 SSE 帧自动重组。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
 > ⚡ 本项目架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系。
@@ -279,6 +279,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
   → COSY 签名            RSA(1024) 包裹 AES-128 会话密钥 → info(AES-CBC 身份)
                          Bearer = COSY.{payloadB64}.{md5(payload\ncosyKey\ndate\nbody\npath)}
   → POST {gateway}/algo/api/v2/service/pro/sse/agent_chat_generation?…&Encode=1
+  → SSE 帧重组           被切断/注入裸换行的帧按空行分块拼回（社区实测约 3% 事件）
   → SSE 信封解包          {"headers","body","statusCodeValue"} 嵌套帧 → 内层 OpenAI chunk
   → 标准 OpenAI SSE / chat.completion 回给客户端
 ```
@@ -399,10 +400,10 @@ Parse Error: Unterminated string
 
 | 链路 | 处置 |
 |---|---|
-| **chat 流式**（omp 主用，生产 590/673 次） | 新增 `iter_client_sse` 转发层：tool_calls 分片**按 index 缓冲**，收尾时逐 index 判定完整性 —— 可解析则按原顺序补发，残缺则整组丢弃。content/reasoning 仍即时透传。 |
-| chat 非流式聚合 | 丢弃残缺调用（WARN 日志）；全被丢弃时 `finish_reason` 降级 `stop` |
-| responses 流式 | 补发 `output_item.done`（`status: incomplete`）维持 added/done 配对；**不带 `arguments` 字段**（空串会被客户端解析成 `{}` 并执行）；整轮置 `incomplete` |
-| responses 非流式 | 丢弃残缺调用 |
+| **chat 流式**（omp 主用，生产 590/673 次） | `iter_client_sse` 转发层：tool_calls 分片**按 index 缓冲**，收尾时逐 index 判定完整性 —— 可解析则按原顺序补发，残缺则整组丢弃；有丢弃时收尾帧一律降级 `length`（`stop`/`tool_calls` 皆然）。content/reasoning 仍即时透传，另含 DSML 文本兜底（见 §4.1）。 |
+| chat 非流式聚合 | 丢弃残缺调用（WARN 日志）；**只要**有调用被丢弃，`finish_reason` 一律置 `length`（哪怕还有合法调用、哪怕全丢光）—— 客户端据此重试/续写，而不是把残缺轮次当「成功的空响应」 |
+| responses 流式 | arguments 分片**不在聚合期下发**（半截 JSON 一旦写出就无法撤回），收尾判定完整才补发 `function_call_arguments.delta`；残缺则补发 `output_item.done`（`status: incomplete`）维持 added/done 配对，**不带 `arguments` 字段**（空串会被客户端解析成 `{}` 并执行）；整轮置 `incomplete` |
+| responses 非流式 | 丢弃残缺调用；整轮 `status: incomplete`（`incomplete_details.reason=max_output_tokens`） |
 
 > **custom freeform 工具例外**：这类工具的载荷本就是自由文本（网关的
 > `CUSTOM_TOOL_HINT` 要求模型原样放入 `input`），不是 JSON，按「能否解析」
@@ -419,6 +420,76 @@ Parse Error: Unterminated string
 
 > 残缺调用**丢弃**而非补成 `{}`：后者会伪造「合法」外观，让客户端误以为
 > 工具调用成功，掩盖了流被截断这一事实。
+### 4.1 工具语境隔离与 DSML 文本兜底
+
+**工具语境隔离**（`build_qoder_body`）：客户端自带 tools 但**没带 system** 时，不再
+继承 `baseprompt.json` 里那 12KB 的 Qoder CLI 系统提示词 —— 它教的是 Qoder 桌面端
+内置工具（Task/TodoWrite/Edit/Bash…）的用法与桌面端语境（如
+`Working directory: D:/Projects/Qoder`），模型会照着写出与客户端实际声明的工具
+schema 不符的调用（实测表现为非法工具 payload、半截/错位 arguments）。此时改用中性
+基座（`SYSTEM_PROMPT`，默认 `You are a helpful assistant.`），工具定义完全以客户端
+`tools` 为准。客户端自带 system 时仍以客户端的为准；既无 system 也无 tools 时保持
+原行为（保留模板提示）。
+
+**DSML 文本兜底**（chat 与 responses 双路径）：模型偶尔把调用写成 DeepSeek 风格的
+`<｜DSML｜calls>…</｜DSML｜calls>` 文本而不是结构化 tool_calls。两条路径都在「本轮
+没有任何结构化 tool_calls」时解析该文本并转成标准 tool_calls：
+
+- **非流式**：组装完 message 后解析；命中则填 `message.tool_calls` +
+  `finish_reason=tool_calls`，content 换成清理后的文本；
+- **流式**：content 在起始候选之前即时透传，候选之后暂存；收尾（finish 帧 / 流结束）
+  统一判定 —— 命中则补发 tool_calls 分片帧（首帧 id+name，次帧完整 arguments）并把
+  收尾帧改写为 `tool_calls`；未命中则把暂存文本作为普通 content 补发。增量匹配器只做
+  「与 `<｜DSML｜calls` 前缀相容」判定，普通文本里的 `<` 最多延迟一个片段；断流时
+  暂存文本同样补发，不闷内容；
+- **白名单**：仅当解析出的 invoke 名**全部**在客户端声明的工具名集合内
+  （`declared_tool_names`）才转换，否则原样保留文本 —— 绝不把模型随手写的文本变成
+  客户端不认识的工具调用。
+### 4.2 内部协议文本的泄漏回读（上游 issue #8/#9/#11/#16 同源修复）
+
+长会话里模型偶尔**照格式复述**网关内部协议文本而不是给结构化 tool_calls，客户端会
+把这段文本当正文显示、本轮调用不执行。两条形态各自处置：
+
+| 形态 | 判据 | 处置 |
+|---|---|---|
+| `[assistant 请求调用工具]` + JSON 数组 `[{name, arguments}]` | 整段 strip 后**恰好**是该形态（可带 ``` 围栏），数组非空、name 非空、arguments 是合法 JSON，且**所有 name 命中本次声明的工具名** | 还原为结构化 tool_calls（chat 流式为 tool_calls 增量帧 + 收尾帧改写 `tool_calls`；非流式为 `message.tool_calls`），正文清空 |
+| `[工具结果…]` 回声块 | strip 后是合法开标记行，且出现闭标记 `[工具结果结束]` 或标记后以 `{["<` 开头 | **吞掉**（不还原：还原需要与历史 `tool_call_id` 配对） |
+
+**截断防护**（issue #9/#16）：正文以 marker 开头、声明了工具、但数组**没写完/非法**
+（含截断落在未写完的 `\uXXXX` 转义里）时整段吞掉 —— 绝不把内部协议文本透传给终端
+用户。完整但未命中白名单的数组保持 fail-open 透传（那是模型在讨论该标记，不是回声）。
+
+**流式 hold-back**（issue #16-B1）：跨帧补全窗口 = 最长标记长度 − 1（17 字符），
+只有帧/缓冲**末尾**的这 17 字符内匹配到标记真前缀时才暂留；下一帧证伪立即补发
+（fail-open）。「散文 + marker 落在同一帧」时先按标记切分：marker 之前的散文**立即
+发出**（不拖首字延迟），marker 及其后进暂存。暂存上限 32KB / 200 帧，超限 fail-open
+放行并记 WARN。`UpstreamStatus`（排队/额度控制流）直接放行**不补发**，否则会把
+handler 的 `emitted` 置真、关掉流内排队与瞬时重开；普通断连则把非泄漏候选的暂存按
+正文补发（不闷内容）。
+
+覆盖范围：chat 流式 / chat 非流式 / responses 流式 / responses 非流式四条出口
+（与 §4 的截断防护同一批链路）。**客户端没声明工具时整层直通**（不暂存、不还原、
+不吞）——与 DSML 兜底同一口径：没有声明集合就无从校验白名单，宁可 fail-open 把文本
+交给用户，也不凭空造出客户端不认识的 tool_calls。
+### 4.3 上游 SSE 断帧重组（社区实测：帧被从 JSON 中间切断）
+
+Qoder 网关（agent 端点与 api2-v2 都实测到）偶发把一帧的字节**从 JSON 中间切断、
+注入裸换行**（约 3% 事件），续行可能没有 `data:` 前缀，甚至切在 `data:` 前缀内部
+（`data\n: {...}`）。逐行读取时半截 JSON 解析失败 → 整帧被静默丢弃；丢的若是带
+`id`/`name` 的工具头帧，客户端只剩参数增量（New API 侧报
+`tool call delta is missing id or name`）。
+
+处置（`_reframe_sse_lines`，参考 zenodinh/pi-provider-qoder#12 与
+saulgoodgirl/QoderGateway#12）：
+
+- **按空行分块、块内无分隔符拼接**：注入的裸换行不在原始载荷里（合法 JSON 不可能含
+  裸换行），块内各行按原字节顺序直接相连才是原帧；**先拼接、后剥 `data:` 前缀**，
+  所以切在前缀内部也能还原；
+- **能独立解析的行即时放行**（不引入额外延迟）；解析不了的行缓存并拼后续行；
+- **始终闭合不了的帧丢弃**并记 WARN + `sse.reframe` 事件（半截 JSON 绝不透传）：
+  流末仍未决、单块超 1MB、或新行自身已是完整帧（旧块再也不会闭合）三种情形；
+- 心跳/注释（`:`）、`event:`/`id:`/`retry:` 元数据行与 `[DONE]` 不受影响；
+  `UpstreamStatus`（排队/额度）照常上抛，重组层不吞控制流。
 ### 5. 稳定物理设备指纹隔离 (`derive_id`)
 
 双区域统一方案：以账号 UID + 业务盐单向 MD5 派生固定 `machineId` / `sessionId` / `machineType` / `machineToken`，COSY 签名头逐请求携带：
@@ -524,10 +595,11 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（209 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
-# 独占路由、签到能力门控与 DISABLED 归一化、请求体、信封解包、custom 工具转译、
-# 本机凭证扫描）
+# 独占路由、签到能力门控与 DISABLED 归一化、请求体（含工具语境隔离）、信封解包、
+# custom 工具转译、截断 tool_call 防护（四条链路）、DSML 文本兜底、
+# 泄漏文本回读（五形态 + 误伤）、SSE 断帧重组、本机凭证扫描）
 python _test_qoder.py
 
 # 直接启动
