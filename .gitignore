@@ -5,6 +5,7 @@ accounts/*
 
 # 运行时数据：请求流水与指标快照
 usage/
+_use/
 
 # ---- Python 运行产物 ----
 __pycache__/
